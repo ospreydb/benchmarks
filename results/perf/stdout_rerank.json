@@ -1,0 +1,82 @@
+{
+  "rerank_store": "/home/ramos/orca/workspaces/osprey-benchmarks/artifacts/perf_profile/segment.osr",
+  "simd_tier": "Avx512",
+  "query_tokens": 5,
+  "token_dim": 128,
+  "gamma": 0.28,
+  "candidates_evaluated": 200,
+  "lut_synthesis_us": 20,
+  "maxsim_ms": 0.340889,
+  "hits": [
+    {
+      "rank": 1,
+      "doc_id": 147,
+      "maxsim_score": 1.8943133,
+      "found_in_osr": true,
+      "doc_token_count": 32
+    },
+    {
+      "rank": 2,
+      "doc_id": 158,
+      "maxsim_score": 1.8214283,
+      "found_in_osr": true,
+      "doc_token_count": 32
+    },
+    {
+      "rank": 3,
+      "doc_id": 81,
+      "maxsim_score": 1.8022105,
+      "found_in_osr": true,
+      "doc_token_count": 32
+    },
+    {
+      "rank": 4,
+      "doc_id": 193,
+      "maxsim_score": 1.8015565,
+      "found_in_osr": true,
+      "doc_token_count": 32
+    },
+    {
+      "rank": 5,
+      "doc_id": 152,
+      "maxsim_score": 1.7164149,
+      "found_in_osr": true,
+      "doc_token_count": 32
+    },
+    {
+      "rank": 6,
+      "doc_id": 157,
+      "maxsim_score": 1.714453,
+      "found_in_osr": true,
+      "doc_token_count": 32
+    },
+    {
+      "rank": 7,
+      "doc_id": 104,
+      "maxsim_score": 1.6550694,
+      "found_in_osr": true,
+      "doc_token_count": 32
+    },
+    {
+      "rank": 8,
+      "doc_id": 16,
+      "maxsim_score": 1.6367162,
+      "found_in_osr": true,
+      "doc_token_count": 32
+    },
+    {
+      "rank": 9,
+      "doc_id": 5,
+      "maxsim_score": 1.6200718,
+      "found_in_osr": true,
+      "doc_token_count": 32
+    },
+    {
+      "rank": 10,
+      "doc_id": 185,
+      "maxsim_score": 1.5892513,
+      "found_in_osr": true,
+      "doc_token_count": 32
+    }
+  ]
+}

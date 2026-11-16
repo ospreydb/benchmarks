@@ -1,0 +1,24 @@
+[package]
+name = "osprey-bench-runner"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Reproducible benchmark runner for OspreyDB (S3Vec + WaRP + LUT-Rank)"
+
+[dependencies]
+osprey-core = { git = "https://github.com/ospreydb/ospreydb.git", branch = "main" }
+osprey-simd = { git = "https://github.com/ospreydb/ospreydb.git", branch = "main" }
+osprey-storage = { git = "https://github.com/ospreydb/ospreydb.git", branch = "main" }
+
+clap = { version = "4.5", features = ["derive"] }
+memmap2 = "0.9"
+object_store = { version = "0.11", features = ["aws"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true

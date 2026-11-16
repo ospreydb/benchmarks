@@ -1,0 +1,36 @@
+# Python & virtual environments
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Downloaded / prepared datasets & generated binary index artifacts
+datasets/raw/
+datasets/prepared/
+artifacts/
+*.osi
+*.osv
+*.osr
+*.bin
+*.fvecs
+*.ivecs
+*.bvecs
+*.parquet
+*.npy
+*.tar.gz
+*.zip
+
+# Docker volumes
+docker/minio-data/
+docker/qdrant-data/
+docker/pgvector-data/
+
+# Temporary profiling data
+perf.data
+perf.data.old
+*.folded
+
+# Rust build artifacts
+rust/target/
+rust/.cargo/
+

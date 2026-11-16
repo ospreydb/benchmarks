@@ -1,0 +1,8 @@
+[info] kernel.perf_event_paranoid = 4
+CPU(s):                                    12
+Lista de CPU(s) on-line:                   0-11
+CPU(s) MHz de escala:                      98%
+cache de L1d:                              192 KiB (6 instâncias)
+cache de L2:                               6 MiB (6 instâncias)
+cache de L3:                               32 MiB (1 instância)
+CPU(s) de nó0 NUMA:                        0-11

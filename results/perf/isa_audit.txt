@@ -1,0 +1,5 @@
+[audit] Disassembly SIMD & prefetch instruction counts for /home/ramos/orca/workspaces/osprey/phase-14/target/release/osprey:
+prefetcht0_count=917
+vpopcntq_count=1292
+vpshufb_count=1978
+vpternlogq_count=609

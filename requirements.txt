@@ -1,0 +1,10 @@
+numpy>=2.0
+scipy>=1.14
+pyarrow>=18.0
+pandas>=2.2
+h5py>=3.12
+matplotlib>=3.9
+requests>=2.32
+qdrant-client>=1.12
+psycopg[binary]>=3.2
+boto3>=1.35

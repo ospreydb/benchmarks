@@ -1,0 +1,1 @@
+[flamegraph] Skipped kernel sampling: perf_event_paranoid=4 (run 'sudo sysctl -w kernel.perf_event_paranoid=-1' and install cargo-flamegraph to emit hardware-sampled SVGs).
