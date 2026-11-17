@@ -1,6 +1,10 @@
 # Controlled recall-matched benchmark — 2026-11-17
 
 Raw data: [`results/compare_engines_controlled.csv`](compare_engines_controlled.csv).
+Figures: [`fig1_memory_disk_controlled.svg`](figures/fig1_memory_disk_controlled.svg),
+[`fig2_recall_latency_controlled.svg`](figures/fig2_recall_latency_controlled.svg),
+[`fig3_build_time_controlled.svg`](figures/fig3_build_time_controlled.svg),
+[`fig4_validation_test_recall_controlled.svg`](figures/fig4_validation_test_recall_controlled.svg).
 
 ## Protocol
 
