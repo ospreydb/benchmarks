@@ -132,6 +132,34 @@ def container_max_vmhwm_kb(name: str) -> int:
     return max((read_vmhwm_kb(pid) for pid in container_pids(name)), default=0)
 
 
+def container_peak_memory_kb(name: str) -> int:
+    """Peak cgroup memory for a container, including its page cache.
+
+    Process ``VmHWM`` undercounts page-cache resident indexes (notably
+    pgvector). cgroup v2 ``memory.peak`` is the comparable container metric.
+    """
+    try:
+        cid = subprocess.check_output(
+            ["docker", "inspect", "-f", "{{.Id}}", name],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        ).strip()
+        candidates = [
+            Path(f"/sys/fs/cgroup/system.slice/docker-{cid}.scope/memory.peak"),
+            Path(f"/sys/fs/cgroup/docker/{cid}/memory.peak"),
+            Path(
+                f"/sys/fs/cgroup/memory/docker/{cid}/memory.max_usage_in_bytes"
+            ),
+        ]
+        for path in candidates:
+            if path.exists():
+                return int(path.read_text().strip()) // 1024
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return container_max_vmhwm_kb(name)
+
+
 class RssSampler:
     """Samples Peak Process RSS (VmHWM) in a background thread."""
 
@@ -353,19 +381,19 @@ def make_splits(
     n_measure: int,
 ) -> Dict[str, Any]:
     total = len(queries)
-    n_calib = min(n_calib, total)
-    n_warmup = min(n_warmup, max(0, total - n_calib))
+    if n_calib < 1:
+        raise ValueError("n_calib must be >= 1")
+    if n_calib + n_warmup >= total:
+        raise ValueError(
+            f"need at least one test query: total={total} calib={n_calib} warmup={n_warmup}"
+        )
     calib_slice = slice(0, n_calib)
     warm_slice = slice(n_calib, n_calib + n_warmup)
     pool_idx = np.arange(n_calib + n_warmup, total, dtype=np.int64)
-    if len(pool_idx) == 0:
-        pool_idx = np.arange(total, dtype=np.int64)
-    if len(pool_idx) >= n_measure:
-        test_idx = pool_idx[:n_measure]
-        unique_test = n_measure
-    else:
-        test_idx = np.resize(pool_idx, n_measure)
-        unique_test = len(pool_idx)
+    # Never repeat test queries: measure at most the unique remaining pool.
+    requested = n_measure if n_measure > 0 else len(pool_idx)
+    test_idx = pool_idx[: min(requested, len(pool_idx))]
+    measured = len(test_idx)
     return {
         "calib": queries[calib_slice],
         "calib_gt": gt[calib_slice],
@@ -376,8 +404,8 @@ def make_splits(
         "n_total": total,
         "n_calib": n_calib,
         "n_warmup": n_warmup,
-        "n_measure": n_measure,
-        "unique_test": unique_test,
+        "n_measure": measured,
+        "unique_test": measured,
     }
 
 
@@ -456,6 +484,29 @@ class OspreyHttpEngine:
             "refine_multiplier": refine_multiplier,
         }
 
+    def prepare(self, query: np.ndarray, cfg: Dict[str, Any]) -> bytes:
+        return json.dumps(
+            self._payload(query, cfg["nprobe"], cfg["refine_m"], 10, 0)
+        ).encode()
+
+    def query_prepared(
+        self, payload: bytes
+    ) -> Tuple[List[int], float, float, Dict[str, Any]]:
+        assert self.client is not None
+        started = time.perf_counter()
+        resp = self.client.post(
+            f"{self.base_url}/search",
+            content=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        client_ms = (time.perf_counter() - started) * 1000.0
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Osprey HTTP {resp.status_code}: {resp.text}")
+        resp.raise_for_status()
+        body = resp.json()
+        ids = [int(x) for x in body["doc_ids"]]
+        return ids, client_ms, float(body["server_ms"]), body
+
     def query(
         self,
         query: np.ndarray,
@@ -531,6 +582,54 @@ class OspreyHttpEngine:
         server_ms = [r[2] for r in results if r is not None]
         return ids, client_ms, server_ms, wall_s
 
+    async def _concurrent_payloads(
+        self, payloads: Sequence[bytes], workers: int
+    ) -> Tuple[List[List[int]], List[float], List[float], float]:
+        limits = httpx.Limits(
+            max_connections=workers, max_keepalive_connections=workers
+        )
+        results: List[Optional[Tuple[List[int], float, float]]] = [None] * len(payloads)
+        queue: asyncio.Queue[int] = asyncio.Queue()
+        for idx in range(len(payloads)):
+            queue.put_nowait(idx)
+
+        async with httpx.AsyncClient(timeout=120.0, limits=limits) as client:
+
+            async def worker() -> None:
+                while True:
+                    try:
+                        idx = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return
+                    started = time.perf_counter()
+                    resp = await client.post(
+                        f"{self.base_url}/search",
+                        content=payloads[idx],
+                        headers={"Content-Type": "application/json"},
+                    )
+                    client_ms = (time.perf_counter() - started) * 1000.0
+                    resp.raise_for_status()
+                    body = resp.json()
+                    results[idx] = (
+                        [int(x) for x in body["doc_ids"]],
+                        client_ms,
+                        float(body["server_ms"]),
+                    )
+
+            started = time.perf_counter()
+            await asyncio.gather(*[worker() for _ in range(workers)])
+            wall_s = time.perf_counter() - started
+
+        ids = [r[0] for r in results if r is not None]
+        client_ms = [r[1] for r in results if r is not None]
+        server_ms = [r[2] for r in results if r is not None]
+        return ids, client_ms, server_ms, wall_s
+
+    def concurrent_prepared(
+        self, payloads: Sequence[bytes], workers: int = 16
+    ) -> Tuple[List[List[int]], List[float], List[float], float]:
+        return asyncio.run(self._concurrent_payloads(payloads, workers))
+
     def concurrent(
         self,
         queries: np.ndarray,
@@ -557,6 +656,7 @@ class QdrantEngine:
         self.data_dir = data_dir
         self.dataset = dataset
         self.client = httpx.Client(timeout=120.0)
+        self.current_coll = ""
 
     def close(self) -> None:
         self.client.close()
@@ -635,7 +735,37 @@ class QdrantEngine:
             client.close()
         except Exception:
             pass
+        self.current_coll = coll
         return build_s, coll
+
+    def prepare(self, query: np.ndarray, cfg: Dict[str, Any]) -> bytes:
+        params: Dict[str, Any] = {"hnsw_ef": int(cfg["hnsw_ef"])}
+        if cfg.get("oversampling") is not None:
+            params["quantization"] = {
+                "rescore": True,
+                "oversampling": float(cfg["oversampling"]),
+            }
+        body = {
+            "query": query.tolist(),
+            "limit": 10,
+            "with_payload": False,
+            "params": params,
+        }
+        return json.dumps(body).encode()
+
+    def query_prepared(self, payload: bytes) -> Tuple[List[int], float, float]:
+        started = time.perf_counter()
+        resp = self.client.post(
+            f"{self.url}/collections/{self.current_coll}/points/query",
+            content=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        client_ms = (time.perf_counter() - started) * 1000.0
+        resp.raise_for_status()
+        body = resp.json()
+        ids = [int(p["id"]) for p in body["result"]["points"]]
+        server_ms = float(body.get("time", 0.0)) * 1000.0
+        return ids, client_ms, server_ms
 
     def query(
         self,
@@ -724,6 +854,54 @@ class QdrantEngine:
         client_ms = [r[1] for r in results if r is not None]
         server_ms = [r[2] for r in results if r is not None]
         return ids, client_ms, server_ms, wall_s
+
+    async def _concurrent_payloads(
+        self, payloads: Sequence[bytes], workers: int
+    ) -> Tuple[List[List[int]], List[float], List[float], float]:
+        limits = httpx.Limits(
+            max_connections=workers, max_keepalive_connections=workers
+        )
+        results: List[Optional[Tuple[List[int], float, float]]] = [None] * len(payloads)
+        queue: asyncio.Queue[int] = asyncio.Queue()
+        for idx in range(len(payloads)):
+            queue.put_nowait(idx)
+
+        async with httpx.AsyncClient(timeout=120.0, limits=limits) as client:
+
+            async def worker() -> None:
+                while True:
+                    try:
+                        idx = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return
+                    started = time.perf_counter()
+                    resp = await client.post(
+                        f"{self.url}/collections/{self.current_coll}/points/query",
+                        content=payloads[idx],
+                        headers={"Content-Type": "application/json"},
+                    )
+                    client_ms = (time.perf_counter() - started) * 1000.0
+                    resp.raise_for_status()
+                    body = resp.json()
+                    results[idx] = (
+                        [int(p["id"]) for p in body["result"]["points"]],
+                        client_ms,
+                        float(body.get("time", 0.0)) * 1000.0,
+                    )
+
+            started = time.perf_counter()
+            await asyncio.gather(*[worker() for _ in range(workers)])
+            wall_s = time.perf_counter() - started
+
+        ids = [r[0] for r in results if r is not None]
+        client_ms = [r[1] for r in results if r is not None]
+        server_ms = [r[2] for r in results if r is not None]
+        return ids, client_ms, server_ms, wall_s
+
+    def concurrent_prepared(
+        self, payloads: Sequence[bytes], workers: int = 16
+    ) -> Tuple[List[List[int]], List[float], List[float], float]:
+        return asyncio.run(self._concurrent_payloads(payloads, workers))
 
     def concurrent(
         self,
@@ -884,7 +1062,10 @@ def select_for_targets(
 ) -> Dict[float, Dict[str, Any]]:
     selected: Dict[float, Dict[str, Any]] = {}
     for target in targets:
-        candidates = [r for r in results if r["recall"] >= target - 0.005]
+        # Require the validation recall itself to meet the target. The previous
+        # `target - 0.005` tolerance let configurations through that missed the
+        # target on the independent test split.
+        candidates = [r for r in results if r["recall"] >= target]
         if candidates:
             best = min(candidates, key=cost_fn)
             selected[target] = {**best, "status": "ok"}
@@ -1018,24 +1199,36 @@ def measure_generic(
         Tuple[List[List[int]], List[float], List[float], float],
     ],
     prepared_queries: Optional[Sequence[Any]] = None,
+    prepare_fn: Optional[Callable[[Any, Dict[str, Any]], Any]] = None,
     server_latency_fn: Optional[Callable[[Dict[str, Any]], Tuple[float, float, float]]] = None,
 ) -> Dict[float, Dict[str, Any]]:
     measured: Dict[float, Dict[str, Any]] = {}
     for target, cfg in selected.items():
-        for query in warmup_queries:
-            warmup_fn(query, cfg)
+        if prepared_queries is not None:
+            warm_items = list(warmup_queries)
+            test_items = list(prepared_queries)
+        elif prepare_fn is not None:
+            # Serialize/format requests once, outside the timed loop, so the
+            # HTTP engines do not pay Python JSON cost per query.
+            warm_items = [prepare_fn(query, cfg) for query in warmup_queries]
+            test_items = [prepare_fn(query, cfg) for query in test_queries]
+        else:
+            warm_items = list(warmup_queries)
+            test_items = list(test_queries)
+        for item in warm_items:
+            warmup_fn(item, cfg)
 
         round_stats: List[Dict[str, Any]] = []
         for round_idx in range(rounds):
             print(
                 f"  [measure] target={target:.3f} round={round_idx + 1}/{rounds} "
-                f"queries={len(prepared_queries if prepared_queries is not None else test_queries)}",
+                f"queries={len(test_items)}",
                 flush=True,
             )
             ids: List[List[int]] = []
             latencies: List[float] = []
             server_latencies: List[float] = []
-            source = prepared_queries if prepared_queries is not None else test_queries
+            source = test_items
             for item in source:
                 found, client_ms, server_ms = sequential_fn(item, cfg)
                 ids.append(found)
@@ -1150,6 +1343,12 @@ def build_row(
         "validation_recall": round(float(config.get("recall", 0.0)), 4),
         "test_recall": round(float(stats.get("recall_median", 0.0)), 4),
         "test_recall_std": round(float(stats.get("recall_std", 0.0)), 4),
+        "test_target_met": bool(
+            float(stats.get("recall_median", 0.0)) >= float(target)
+        ),
+        "test_recall_delta": round(
+            float(stats.get("recall_median", 0.0)) - float(target), 4
+        ),
         "p50_ms_median": round(float(stats.get("p50_median", 0.0)), 3),
         "p50_ms_std": round(float(stats.get("p50_std", 0.0)), 3),
         "p95_ms_median": round(float(stats.get("p95_median", 0.0)), 3),
@@ -1159,9 +1358,33 @@ def build_row(
         "server_p50_ms_median": round(float(stats.get("server_p50_median", 0.0)), 3),
         "server_p95_ms_median": round(float(stats.get("server_p95_median", 0.0)), 3),
         "server_p99_ms_median": round(float(stats.get("server_p99_median", 0.0)), 3),
+        "concurrent_p50_ms_median": round(
+            float(stats.get("concurrent_p50_median", 0.0)), 3
+        ),
+        "concurrent_p50_ms_std": round(
+            float(stats.get("concurrent_p50_std", 0.0)), 3
+        ),
+        "concurrent_p95_ms_median": round(
+            float(stats.get("concurrent_p95_median", 0.0)), 3
+        ),
+        "concurrent_p99_ms_median": round(
+            float(stats.get("concurrent_p99_median", 0.0)), 3
+        ),
+        "concurrent_server_p50_ms_median": round(
+            float(stats.get("concurrent_server_p50_median", 0.0)), 3
+        ),
+        "concurrent_server_p95_ms_median": round(
+            float(stats.get("concurrent_server_p95_median", 0.0)), 3
+        ),
+        "concurrent_server_p99_ms_median": round(
+            float(stats.get("concurrent_server_p99_median", 0.0)), 3
+        ),
         "qps_concurrent_median": round(float(stats.get("qps_median", 0.0)), 1),
         "qps_concurrent_std": round(float(stats.get("qps_std", 0.0)), 1),
         "concurrent_recall": round(float(stats.get("concurrent_recall_median", 0.0)), 4),
+        "memory_metric": (
+            "VmHWM (process)" if variant == "osprey_http" else "cgroup memory.peak (container)"
+        ),
         "load_peak_rss_mb": round(load_peak_kb / 1024.0, 1),
         "query_peak_rss_mb": round(query_peak_kb / 1024.0, 1),
         "build_peak_rss_mb": round(build_peak_kb / 1024.0, 1),
@@ -1186,11 +1409,10 @@ def run_controlled(args: Any) -> int:
     engines = [e.strip() for e in args.engines.split(",") if e.strip()]
     rounds = int(args.rounds)
     workers = int(args.workers)
-    n_calib = 200
     n_warmup = int(args.warmup_queries)
     n_measure = int(args.measure_queries)
+    requested_calib = int(getattr(args, "calib_queries", 0) or 0)
     if args.quick:
-        n_calib = min(40, n_calib)
         n_warmup = min(20, n_warmup)
         n_measure = min(40, n_measure)
         rounds = min(1, rounds)
@@ -1231,8 +1453,20 @@ def run_controlled(args: Any) -> int:
                 f"[controlled] {dataset}: refine grid filtered to {refine_grid_ds} "
                 f"(Stage-1 cap {max_stage1}, low_dim={low_dim})"
             )
+        if args.quick:
+            ds_calib = 40
+        elif requested_calib > 0:
+            ds_calib = requested_calib
+        else:
+            # Larger validation split than the old fixed 200 reduces the
+            # validation/test recall gap; 25% of the query file, floor 200.
+            ds_calib = max(200, int(round(len(queries) * 0.25)))
         splits = make_splits(
-            queries, gt, n_calib=n_calib, n_warmup=n_warmup, n_measure=n_measure
+            queries,
+            gt,
+            n_calib=ds_calib,
+            n_warmup=n_warmup,
+            n_measure=n_measure,
         )
         print(
             f"[controlled] {dataset}: {meta.get('num_vectors')} x {dim}d, "
@@ -1302,26 +1536,17 @@ def run_controlled(args: Any) -> int:
                         f"status={cfg['status']}"
                     )
 
-                def seq(item: np.ndarray, cfg: Dict[str, Any]):
-                    ids, cms, sms, _meta = engine.query(
-                        item, cfg["nprobe"], cfg["refine_m"], 10, 0
-                    )
+                def seq(item: bytes, cfg: Dict[str, Any]):
+                    ids, cms, sms, _meta = engine.query_prepared(item)
                     return ids, cms, sms
 
-                def warm(item: np.ndarray, cfg: Dict[str, Any]):
-                    engine.query(item, cfg["nprobe"], cfg["refine_m"], 10, 0)
+                def warm(item: bytes, cfg: Dict[str, Any]):
+                    engine.query_prepared(item)
 
                 def conc(
-                    items: Sequence[np.ndarray], cfg: Dict[str, Any], nworkers: int
+                    items: Sequence[bytes], cfg: Dict[str, Any], nworkers: int
                 ):
-                    return engine.concurrent(
-                        np.asarray(items),
-                        cfg["nprobe"],
-                        cfg["refine_m"],
-                        10,
-                        0,
-                        nworkers,
-                    )
+                    return engine.concurrent_prepared(items, nworkers)
 
                 measured = measure_generic(
                     selected,
@@ -1333,6 +1558,7 @@ def run_controlled(args: Any) -> int:
                     sequential_fn=seq,
                     warmup_fn=warm,
                     concurrent_fn=conc,
+                    prepare_fn=engine.prepare,
                 )
             finally:
                 query_peak_kb = sampler.stop()
@@ -1361,7 +1587,7 @@ def run_controlled(args: Any) -> int:
                         / (1024.0 * 1024.0),
                         rounds,
                         workers,
-                        "HTTP server in osprey-bench-runner; client and server share localhost.",
+                        "HTTP server in osprey-bench-runner; client and server share localhost; peak memory is process VmHWM.",
                     )
                 )
 
@@ -1372,15 +1598,11 @@ def run_controlled(args: Any) -> int:
             fp32 = QdrantEngine(
                 QDRANT_FP32_URL, "osprey-bench-qdrant", ROOT / "docker" / "qdrant-data", dataset
             )
-            sampler = RssSampler(fp32.vmhwm_kb, interval=0.5)
-            sampler.start()
             try:
                 build_s, coll = fp32.setup(base, dim, "fp32", bq=False)
             finally:
-                build_peak_kb = sampler.stop()
-            load_peak_kb = fp32.vmhwm_kb()
-            sampler = RssSampler(fp32.vmhwm_kb, interval=0.5)
-            sampler.start()
+                build_peak_kb = container_peak_memory_kb("osprey-bench-qdrant")
+            load_peak_kb = 0  # the container has no separate load phase
             try:
                 print(f"[controlled] {dataset}: calibrating Qdrant FP32")
                 calib = calibrate_qdrant(
@@ -1395,18 +1617,16 @@ def run_controlled(args: Any) -> int:
                         f"val_recall={cfg['recall']:.4f} status={cfg['status']}"
                     )
 
-                def seq(item: np.ndarray, cfg: Dict[str, Any]):
-                    return fp32.query(coll, item, cfg["hnsw_ef"], None)
+                def seq(item: bytes, cfg: Dict[str, Any]):
+                    return fp32.query_prepared(item)
 
-                def warm(item: np.ndarray, cfg: Dict[str, Any]):
-                    fp32.query(coll, item, cfg["hnsw_ef"], None)
+                def warm(item: bytes, cfg: Dict[str, Any]):
+                    fp32.query_prepared(item)
 
                 def conc(
-                    items: Sequence[np.ndarray], cfg: Dict[str, Any], nworkers: int
+                    items: Sequence[bytes], cfg: Dict[str, Any], nworkers: int
                 ):
-                    return fp32.concurrent(
-                        coll, np.asarray(items), cfg["hnsw_ef"], None, nworkers
-                    )
+                    return fp32.concurrent_prepared(items, nworkers)
 
                 measured = measure_generic(
                     selected,
@@ -1418,9 +1638,10 @@ def run_controlled(args: Any) -> int:
                     sequential_fn=seq,
                     warmup_fn=warm,
                     concurrent_fn=conc,
+                    prepare_fn=fp32.prepare,
                 )
             finally:
-                query_peak_kb = sampler.stop()
+                query_peak_kb = container_peak_memory_kb("osprey-bench-qdrant")
             disk_mb = fp32.disk_mb(coll)
             fp32.close()
             stop_qdrant_fp32()
@@ -1440,11 +1661,11 @@ def run_controlled(args: Any) -> int:
                         query_peak_kb,
                         build_peak_kb,
                         build_s,
-                        build_s,
+                        0.0,
                         disk_mb,
                         rounds,
                         workers,
-                        "Qdrant compose container; HNSW m=16 ef_construct=100.",
+                        "Qdrant compose container; HNSW m=16 ef_construct=100; no separate load phase; peak memory is cgroup memory.peak.",
                     )
                 )
 
@@ -1454,15 +1675,11 @@ def run_controlled(args: Any) -> int:
             start_qdrant_bq_container()
             bq_url = f"http://127.0.0.1:{QDRANT_BQ_PORT}"
             bq = QdrantEngine(bq_url, QDRANT_BQ_NAME, QDRANT_BQ_DATA, dataset)
-            sampler = RssSampler(bq.vmhwm_kb, interval=0.5)
-            sampler.start()
             try:
                 build_s, coll = bq.setup(base, dim, "bq", bq=True)
             finally:
-                build_peak_kb = sampler.stop()
-            load_peak_kb = bq.vmhwm_kb()
-            sampler = RssSampler(bq.vmhwm_kb, interval=0.5)
-            sampler.start()
+                build_peak_kb = container_peak_memory_kb(QDRANT_BQ_NAME)
+            load_peak_kb = 0  # the container has no separate load phase
             try:
                 print(f"[controlled] {dataset}: calibrating Qdrant BQ")
                 calib = calibrate_qdrant(
@@ -1490,22 +1707,16 @@ def run_controlled(args: Any) -> int:
                         f"status={cfg['status']}"
                     )
 
-                def seq(item: np.ndarray, cfg: Dict[str, Any]):
-                    return bq.query(coll, item, cfg["hnsw_ef"], cfg["oversampling"])
+                def seq(item: bytes, cfg: Dict[str, Any]):
+                    return bq.query_prepared(item)
 
-                def warm(item: np.ndarray, cfg: Dict[str, Any]):
-                    bq.query(coll, item, cfg["hnsw_ef"], cfg["oversampling"])
+                def warm(item: bytes, cfg: Dict[str, Any]):
+                    bq.query_prepared(item)
 
                 def conc(
-                    items: Sequence[np.ndarray], cfg: Dict[str, Any], nworkers: int
+                    items: Sequence[bytes], cfg: Dict[str, Any], nworkers: int
                 ):
-                    return bq.concurrent(
-                        coll,
-                        np.asarray(items),
-                        cfg["hnsw_ef"],
-                        cfg["oversampling"],
-                        nworkers,
-                    )
+                    return bq.concurrent_prepared(items, nworkers)
 
                 measured = measure_generic(
                     selected,
@@ -1517,9 +1728,10 @@ def run_controlled(args: Any) -> int:
                     sequential_fn=seq,
                     warmup_fn=warm,
                     concurrent_fn=conc,
+                    prepare_fn=bq.prepare,
                 )
             finally:
-                query_peak_kb = sampler.stop()
+                query_peak_kb = container_peak_memory_kb(QDRANT_BQ_NAME)
             disk_mb = bq.disk_mb(coll)
             bq.close()
             stop_qdrant_bq_container()
@@ -1539,11 +1751,11 @@ def run_controlled(args: Any) -> int:
                         query_peak_kb,
                         build_peak_kb,
                         build_s,
-                        build_s,
+                        0.0,
                         disk_mb,
                         rounds,
                         workers,
-                        "Dedicated Qdrant container; binary quantization always_ram, rescore=true.",
+                        "Dedicated Qdrant container; binary quantization always_ram, rescore=true; no separate load phase; peak memory is cgroup memory.peak.",
                     )
                 )
 
@@ -1556,18 +1768,14 @@ def run_controlled(args: Any) -> int:
             except Exception as exc:  # noqa: BLE001 - best-effort cleanup
                 print(f"  [warn] could not clear pgvector tables: {exc}")
             pg = PgvectorEngine(dataset, dim)
-            sampler = RssSampler(pg.vmhwm_kb, interval=0.5)
-            sampler.start()
             try:
                 build_s = pg.setup(base)
             finally:
-                build_peak_kb = sampler.stop()
-            load_peak_kb = pg.vmhwm_kb()
+                build_peak_kb = container_peak_memory_kb(PGVECTOR_CONTAINER)
+            load_peak_kb = 0  # the container has no separate load phase
             calib_q = [pg.vector_literal(q) for q in splits["calib"]]
             warm_q = [pg.vector_literal(q) for q in splits["warmup"]]
             test_q = [pg.vector_literal(q) for q in splits["test"]]
-            sampler = RssSampler(pg.vmhwm_kb, interval=0.5)
-            sampler.start()
             try:
                 print(f"[controlled] {dataset}: calibrating pgvector")
                 calib = calibrate_pgvector(pg, calib_q, splits["calib_gt"], ef_grid)
@@ -1611,7 +1819,7 @@ def run_controlled(args: Any) -> int:
                         ),
                     )
             finally:
-                query_peak_kb = sampler.stop()
+                query_peak_kb = container_peak_memory_kb(PGVECTOR_CONTAINER)
             disk_mb = pg.disk_mb()
             stop_pgvector()
             for target, stats in measured.items():
@@ -1630,11 +1838,11 @@ def run_controlled(args: Any) -> int:
                         query_peak_kb,
                         build_peak_kb,
                         build_s,
-                        build_s,
+                        0.0,
                         disk_mb,
                         rounds,
                         workers,
-                        "PostgreSQL container; HNSW m=16 ef_construction=100; server time via EXPLAIN ANALYZE (sample=100).",
+                        "PostgreSQL container; HNSW m=16 ef_construction=100; server time via EXPLAIN ANALYZE (sample=100); no separate load phase; peak memory is cgroup memory.peak incl. page cache.",
                     )
                 )
 

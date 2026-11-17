@@ -84,15 +84,21 @@ make bench-compare
 `scripts/bench_controlled.py` (invoked by `scripts/bench_compare_engines.py --controlled`)
 removes the main methodological biases of the legacy comparison:
 
-- Calibrates each engine on 200 validation queries until `Recall@10 >= target - 0.005`
-  for the targets `0.95` and `0.97`, then selects the cheapest configuration and reports
-  `ok` or `below_target`.
+- Calibrates on 25% of the query file (minimum 200 validation queries), requires
+  `Recall@10 >= target` on validation for `0.95` and `0.97`, then selects the cheapest
+  configuration and reports `ok` or `below_target`. The old `target - 0.005` tolerance was
+  removed because it selected configurations that missed the target on the test split.
 - Uses HTTP client-server for OspreyDB (`osprey-bench-runner serve`) and Qdrant, and SQL
   client-server for pgvector. No in-process Osprey timing.
-- Runs 200 warmup plus 1000 measured queries in 3 independent rounds, reporting median and
-  standard deviation of P50/P95/P99 and concurrent QPS with 16 workers.
-- Samples Peak RSS from `VmHWM` for the active process (Osprey server or Docker container)
-  and records index/artifact size.
+- Runs 200 warmup plus all remaining test queries (up to 1000) in 3 independent rounds,
+  without repeating queries. Reports median and standard deviation of P50/P95/P99,
+  concurrent P50/P95/P99, and concurrent QPS with 16 workers.
+- Precomputes JSON request bodies for OspreyDB/Qdrant outside the timed loop, so the HTTP
+  engines do not pay Python serialization cost per query. pgvector already uses
+  precomputed SQL literals.
+- Reports `VmHWM` for the OspreyDB process and cgroup v2 `memory.peak` for Docker
+  containers. The container metric includes page-cache-resident indexes, which fixes the
+  pgvector RSS undercount.
 - Starts exactly one engine at a time: Qdrant/pgvector containers are stopped before the
   next engine starts and after each dataset, so background optimization or autovacuum from
   one engine cannot contaminate another engine's stage.
@@ -103,14 +109,19 @@ for Qdrant/pgvector and OspreyDB.
 
 Fairness caveats:
 
-- Cohere is the 100k subset, not 1M. Its 1000 queries leave 600 unique measured queries
-  after calibration and warmup, which are cycled to reach 1000 measured requests.
+- Cohere is the 100k subset, not 1M. With the automatic split, Cohere uses 250 calibration,
+  200 warmup, and 550 test queries; measured counts are written to the CSV and no query is
+  repeated.
 - OspreyDB runs with a bounded 256 MB cache (`--controlled-cache-mb 256`) while
   Qdrant/pgvector keep their full indexes in RAM. This favors the competitors on latency
-  and is intentional: it measures OspreyDB's bounded-RAM path. `VmHWM` is reported so the
-  memory trade-off is explicit.
+  and is intentional: it measures OspreyDB's bounded-RAM path. The reported peak-memory
+  metric makes the trade-off explicit.
 - The engines use different index families (OspreyDB 1-bit RaBitQ + f16 rescore, HNSW FP32,
-  and HNSW 1-bit BQ + rescore). Recall is matched, not the algorithm.
+  and HNSW 1-bit BQ + rescore). Recall is matched, not the algorithm. Qdrant BQ is included
+  as a negative result where it cannot reach the target (notably 128-d SIFT).
+- QPS is throughput with 16 async workers, not a server-only ranking. Request serialization
+  is now outside the timed loop, but HTTP (OspreyDB/Qdrant) and SQL (pgvector) still differ;
+  use server P50 and concurrent latency alongside QPS.
 - There is no CPU pinning or cgroup isolation; run on an idle machine for publication
   numbers. Cohere 768d at 100k is the supported scale in this repository.
 

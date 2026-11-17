@@ -416,6 +416,12 @@ def main() -> int:
     )
     parser.add_argument("--engines", default="osprey,qdrant_fp32,qdrant_bq,pgvector")
     parser.add_argument("--workers", type=int, default=16)
+    parser.add_argument(
+        "--calib-queries",
+        type=int,
+        default=0,
+        help="Validation queries for recall calibration (0 = 25%% of the query set, minimum 200).",
+    )
     parser.add_argument("--warmup-queries", type=int, default=200)
     parser.add_argument("--measure-queries", type=int, default=1000)
     parser.add_argument("--rounds", type=int, default=3)
