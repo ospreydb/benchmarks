@@ -6,6 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use axum::{
+    extract::State,
+    http::StatusCode,
+    routing::{get, post},
+    Json, Router,
+};
 use clap::{Parser, Subcommand};
 use memmap2::Mmap;
 use object_store::path::Path as ObjectPath;
@@ -59,6 +65,19 @@ enum Cmd {
         #[arg(long)]
         out_json: PathBuf,
     },
+    /// Serves the S3Vec index over local HTTP for controlled client-server benchmarks.
+    Serve {
+        #[arg(long)]
+        osi: PathBuf,
+        #[arg(long)]
+        slabs: String,
+        #[arg(long, default_value = "127.0.0.1:18080")]
+        bind: String,
+        #[arg(long, default_value_t = 16)]
+        cache_mb: usize,
+        #[arg(long)]
+        no_warp: bool,
+    },
     /// Evaluates CPU LUT-Rank (.osr) against MS MARCO / BEIR queries and qrels.
     LutrankEval {
         #[arg(long)]
@@ -109,6 +128,121 @@ struct SearchEvalPoint {
     osv_bytes: u64,
     vm_hwm_mb: f64,
     simd_tier: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServerSearchRequest {
+    query: Vec<f32>,
+    #[serde(default = "default_server_nprobe")]
+    nprobe: usize,
+    #[serde(default)]
+    refine_m: usize,
+    #[serde(default = "default_server_top_k")]
+    top_k: usize,
+    #[serde(default)]
+    refine_multiplier: usize,
+}
+
+fn default_server_nprobe() -> usize {
+    32
+}
+
+fn default_server_top_k() -> usize {
+    10
+}
+
+#[derive(Debug, Serialize)]
+struct ServerSearchResponse {
+    doc_ids: Vec<u64>,
+    server_ms: f64,
+    stage1_ms: f64,
+    refine_ms: f64,
+    candidates: usize,
+    effective_nprobe: usize,
+    effective_candidates: usize,
+    stage1_limit: usize,
+    low_dim_oversample: bool,
+}
+
+struct ServerState {
+    osi: Arc<OsiIndex>,
+    orig_dim: u16,
+    refine_stage: Arc<RefineStage>,
+    directory: Vec<MinipageDirectoryEntry>,
+    cache: Arc<MinipageLruCache>,
+    store: Arc<dyn ObjectStore>,
+    obj_path: ObjectPath,
+    remote_cfg: RemoteStoreConfig,
+}
+
+async fn handle_server_search(
+    State(state): State<Arc<ServerState>>,
+    Json(req): Json<ServerSearchRequest>,
+) -> Result<Json<ServerSearchResponse>, (StatusCode, String)> {
+    if req.query.len() != usize::from(state.orig_dim) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "expected query dimension {}, got {}",
+                state.orig_dim,
+                req.query.len()
+            ),
+        ));
+    }
+    if req.top_k == 0 {
+        return Err((StatusCode::BAD_REQUEST, "top_k must be > 0".to_string()));
+    }
+
+    let plan = SearchOptions {
+        nprobe: req.nprobe,
+        candidates: req.refine_m,
+        top_k: req.top_k,
+        rerank_top_m: 0,
+        refine_multiplier: req.refine_multiplier,
+    }
+    .resolve(state.orig_dim);
+
+    let t0 = Instant::now();
+    let osi = Arc::clone(&state.osi);
+    let query = req.query.clone();
+    let t_s1 = Instant::now();
+    let hits = tokio::task::spawn_blocking(move || {
+        let simd = SimdEngine::new_auto();
+        osi.search_candidates(&query, plan.effective_nprobe, plan.stage1_limit, &simd)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let stage1_ms = t_s1.elapsed().as_secs_f64() * 1000.0;
+
+    let t_refine = Instant::now();
+    let (refined, _stats) = state
+        .refine_stage
+        .refine_scored_async(
+            &req.query,
+            &hits,
+            req.top_k,
+            &state.directory,
+            &state.cache,
+            &state.store,
+            &state.obj_path,
+            &state.remote_cfg,
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let refine_ms = t_refine.elapsed().as_secs_f64() * 1000.0;
+
+    Ok(Json(ServerSearchResponse {
+        doc_ids: refined.iter().map(|r| r.doc_id).collect(),
+        server_ms: t0.elapsed().as_secs_f64() * 1000.0,
+        stage1_ms,
+        refine_ms,
+        candidates: hits.len(),
+        effective_nprobe: plan.effective_nprobe,
+        effective_candidates: plan.effective_candidates,
+        stage1_limit: plan.stage1_limit,
+        low_dim_oversample: plan.low_dim_oversample,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -327,6 +461,69 @@ fn normalize_slabs_uri(slabs: &str) -> Result<String, String> {
         let abs = std::fs::canonicalize(slabs).map_err(|e| format!("canonicalize {slabs}: {e}"))?;
         Ok(format!("file://{}", abs.display()))
     }
+}
+
+fn run_server(
+    osi_path: &Path,
+    slabs: &str,
+    bind: &str,
+    cache_mb: usize,
+    no_warp: bool,
+) -> Result<(), String> {
+    let file = File::open(osi_path).map_err(|e| format!("open {}: {e}", osi_path.display()))?;
+    let mmap = unsafe { Mmap::map(&file).map_err(|e| e.to_string())? };
+    let _view = OsiMappedView::from_bytes(&mmap).map_err(|e| e.to_string())?;
+    let osi = OsiIndex::from_bytes(&mmap).map_err(|e| e.to_string())?;
+    let orig_dim = osi.header().orig_dim;
+
+    let slabs_uri = normalize_slabs_uri(slabs)?;
+    let remote_cfg = RemoteStoreConfig::default();
+    let (store, obj_path) =
+        build_object_store(&slabs_uri, &remote_cfg).map_err(|e| e.to_string())?;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let (directory, zstd_dict, _osv_bytes) =
+        rt.block_on(load_osv_metadata(&store, &obj_path))?;
+
+    let warp_cfg = if no_warp {
+        WarpConfig {
+            tau_req: 0.0,
+            tau_byte: 1.0,
+            max_coalesce_bytes: 0,
+        }
+    } else {
+        WarpConfig::default()
+    };
+
+    let state = Arc::new(ServerState {
+        osi: Arc::new(osi),
+        orig_dim,
+        refine_stage: Arc::new(RefineStage::new(0, warp_cfg, zstd_dict)),
+        directory,
+        cache: Arc::new(MinipageLruCache::new(cache_mb.saturating_mul(1024 * 1024))),
+        store,
+        obj_path,
+        remote_cfg,
+    });
+
+    let app = Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .route("/search", post(handle_server_search))
+        .with_state(state);
+
+    rt.block_on(async move {
+        let listener = tokio::net::TcpListener::bind(bind)
+            .await
+            .map_err(|e| format!("bind {bind}: {e}"))?;
+        println!("osprey-bench-runner HTTP server listening on http://{bind} (dim={orig_dim})");
+        axum::serve(listener, app)
+            .await
+            .map_err(|e| format!("serve: {e}"))
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -701,6 +898,13 @@ fn main() -> Result<(), String> {
                 &out_json,
             )
         }
+        Cmd::Serve {
+            osi,
+            slabs,
+            bind,
+            cache_mb,
+            no_warp,
+        } => run_server(&osi, &slabs, &bind, cache_mb, no_warp),
         Cmd::LutrankEval {
             osr,
             queries_json,

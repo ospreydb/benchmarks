@@ -11,7 +11,7 @@ COMPARE_DATASETS ?= sift1m cohere768d
 LUTRANK_DATASETS ?= scifact fiqa msmarco
 PARETO_DATASET ?= sift1m
 
-.PHONY: help setup build-rust datasets minio-up minio-down bench-compare bench-compare-adaptive bench-lutrank bench-pareto bench-pareto-adaptive profile-perf plots bench-all clean
+.PHONY: help setup build-rust datasets minio-up minio-down bench-compare bench-compare-controlled bench-compare-adaptive bench-lutrank bench-pareto bench-pareto-adaptive profile-perf plots bench-all clean
 
 help:
 	@echo "OspreyDB Reproducible Benchmark Suite"
@@ -22,6 +22,7 @@ help:
 	@echo "  make minio-up       Start MinIO (tc netem 15ms), Qdrant, and pgvector containers"
 	@echo "  make minio-down     Stop benchmark containers"
 	@echo "  make bench-compare  Run OspreyDB vs Qdrant vs pgvector comparison"
+	@echo "  make bench-compare-controlled  Recall-matched controlled run (0.95/0.97, isolated engines)"
 	@echo "  make bench-compare-adaptive  SIFT1M A/B: refine_multiplier 1 (baseline) vs 0 (adaptive)"
 	@echo "  make bench-lutrank  Run LUT-Rank CPU vs ColBERTv2 benchmark"
 	@echo "  make bench-pareto   Run WaRP Pareto sweep over MinIO + tc netem"
@@ -69,6 +70,21 @@ bench-compare:
 # Isolated SIFT1M A/B for the adaptive low-dimensional oversampling policy.
 # baseline: nprobe=8, refine_m=64, refine_multiplier=1  -> 8/64,  low_dim_oversample=false
 # adaptive: nprobe=8, refine_m=64, refine_multiplier=0  -> 16/128, low_dim_oversample=true
+bench-compare-controlled:
+	$(PYTHON) $(CURDIR)/scripts/bench_compare_engines.py \
+		--controlled \
+		--datasets $(COMPARE_DATASETS) \
+		--recall-target 0.95 0.97 \
+		--engines osprey,qdrant_fp32,qdrant_bq,pgvector \
+		--workers 16 \
+		--warmup-queries 200 \
+		--measure-queries 1000 \
+		--rounds 3 \
+		--controlled-cache-mb 256 \
+		--osprey-bin $(OSPREY_BIN) \
+		--runner-bin $(RUNNER_BIN) \
+		--out-controlled-csv $(CURDIR)/results/compare_engines_controlled.csv
+
 bench-compare-adaptive:
 	$(PYTHON) $(CURDIR)/scripts/bench_compare_engines.py \
 		--datasets sift1m \

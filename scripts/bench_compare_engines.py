@@ -398,6 +398,30 @@ def main() -> int:
     )
     parser.add_argument("--max-queries", type=int, default=200)
     parser.add_argument(
+        "--controlled",
+        action="store_true",
+        help="Run the recall-target controlled protocol (HTTP transport, warmup, 3 rounds, concurrent QPS).",
+    )
+    parser.add_argument(
+        "--recall-target",
+        type=float,
+        nargs="+",
+        default=[0.95, 0.97],
+        help="Recall@10 targets calibrated on the validation split.",
+    )
+    parser.add_argument("--engines", default="osprey,qdrant_fp32,qdrant_bq,pgvector")
+    parser.add_argument("--workers", type=int, default=16)
+    parser.add_argument("--warmup-queries", type=int, default=200)
+    parser.add_argument("--measure-queries", type=int, default=1000)
+    parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--osprey-port", type=int, default=18080)
+    parser.add_argument("--controlled-cache-mb", type=int, default=256)
+    parser.add_argument("--quick", action="store_true", help="Small grids/splits for smoke testing.")
+    parser.add_argument(
+        "--out-controlled-csv",
+        default=str(RESULTS_DIR / "compare_engines_controlled.csv"),
+    )
+    parser.add_argument(
         "--out-csv",
         default=str(RESULTS_DIR / "compare_engines.csv"),
         help="Output CSV (use results/compare_engines_adaptive.csv to preserve the published file).",
@@ -405,6 +429,11 @@ def main() -> int:
     parser.add_argument("--skip-pgvector", action="store_true")
     parser.add_argument("--skip-qdrant", action="store_true")
     args = parser.parse_args()
+
+    if args.controlled:
+        from bench_controlled import run_controlled
+
+        return run_controlled(args)
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     rows: List[Dict[str, object]] = []

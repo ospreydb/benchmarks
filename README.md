@@ -79,6 +79,66 @@ Official comparison (refreshes the published `results/compare_engines.csv` with 
 make bench-compare
 ```
 
+### Controlled, recall-matched comparison (`--controlled`)
+
+`scripts/bench_controlled.py` (invoked by `scripts/bench_compare_engines.py --controlled`)
+removes the main methodological biases of the legacy comparison:
+
+- Calibrates each engine on 200 validation queries until `Recall@10 >= target - 0.005`
+  for the targets `0.95` and `0.97`, then selects the cheapest configuration and reports
+  `ok` or `below_target`.
+- Uses HTTP client-server for OspreyDB (`osprey-bench-runner serve`) and Qdrant, and SQL
+  client-server for pgvector. No in-process Osprey timing.
+- Runs 200 warmup plus 1000 measured queries in 3 independent rounds, reporting median and
+  standard deviation of P50/P95/P99 and concurrent QPS with 16 workers.
+- Samples Peak RSS from `VmHWM` for the active process (Osprey server or Docker container)
+  and records index/artifact size.
+- Starts exactly one engine at a time: Qdrant/pgvector containers are stopped before the
+  next engine starts and after each dataset, so background optimization or autovacuum from
+  one engine cannot contaminate another engine's stage.
+
+Prepared data: SIFT1M (`1M × 128`, 1500 queries) and Cohere 768d (`100k × 768`, 1000
+queries). All vectors are L2-normalized, so cosine and inner-product rankings are identical
+for Qdrant/pgvector and OspreyDB.
+
+Fairness caveats:
+
+- Cohere is the 100k subset, not 1M. Its 1000 queries leave 600 unique measured queries
+  after calibration and warmup, which are cycled to reach 1000 measured requests.
+- OspreyDB runs with a bounded 256 MB cache (`--controlled-cache-mb 256`) while
+  Qdrant/pgvector keep their full indexes in RAM. This favors the competitors on latency
+  and is intentional: it measures OspreyDB's bounded-RAM path. `VmHWM` is reported so the
+  memory trade-off is explicit.
+- The engines use different index families (OspreyDB 1-bit RaBitQ + f16 rescore, HNSW FP32,
+  and HNSW 1-bit BQ + rescore). Recall is matched, not the algorithm.
+- There is no CPU pinning or cgroup isolation; run on an idle machine for publication
+  numbers. Cohere 768d at 100k is the supported scale in this repository.
+
+```bash
+# Build both binaries against the local core checkout.
+make build-rust OSPREY_SRC=/home/ramos/repositories/ospreydb/ospreydb
+
+# Smoke test: small grids and splits.
+.venv/bin/python3 scripts/bench_compare_engines.py --controlled --quick \
+  --datasets cohere768d \
+  --osprey-bin /home/ramos/repositories/ospreydb/ospreydb/target/release/osprey \
+  --runner-bin rust/target/release/osprey-bench-runner \
+  --out-controlled-csv /tmp/controlled_smoke.csv
+
+# Full controlled run (writes results/compare_engines_controlled.csv).
+make bench-compare-controlled
+
+# Equivalent explicit invocation.
+.venv/bin/python3 scripts/bench_compare_engines.py --controlled \
+  --datasets sift1m cohere768d --recall-target 0.95 0.97 \
+  --engines osprey,qdrant_fp32,qdrant_bq,pgvector \
+  --workers 16 --warmup-queries 200 --measure-queries 1000 --rounds 3 \
+  --controlled-cache-mb 256 \
+  --osprey-bin /home/ramos/repositories/ospreydb/ospreydb/target/release/osprey \
+  --runner-bin rust/target/release/osprey-bench-runner \
+  --out-controlled-csv results/compare_engines_controlled.csv
+```
+
 Isolated A/B and Pareto commands (write new files, leaving the published CSVs intact):
 ```bash
 # SIFT1M baseline (8/64) vs adaptive (16/128)
