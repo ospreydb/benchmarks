@@ -914,13 +914,21 @@ def calibrate_osprey(
                 ids.append(found)
                 latencies.append(client_ms)
             p50, _, _ = latency_stats(latencies)
+            recall = recall_at_k(ids, gt)
+            print(
+                f"  [calib][osprey] nprobe={nprobe} refine={refine_m} "
+                f"effective={int(meta.get('effective_nprobe', 0))}/"
+                f"{int(meta.get('effective_candidates', 0))} "
+                f"recall={recall:.4f} p50={p50:.3f}ms",
+                flush=True,
+            )
             results.append(
                 {
                     "nprobe": nprobe,
                     "refine_m": refine_m,
                     "effective_nprobe": int(meta.get("effective_nprobe", 0)),
                     "effective_candidates": int(meta.get("effective_candidates", 0)),
-                    "recall": recall_at_k(ids, gt),
+                    "recall": recall,
                     "p50_ms": p50,
                 }
             )
@@ -949,11 +957,17 @@ def calibrate_qdrant(
                 ids.append(found)
                 latencies.append(client_ms)
             p50, _, _ = latency_stats(latencies)
+            recall = recall_at_k(ids, gt)
+            print(
+                f"  [calib][qdrant] ef={ef} oversampling={oversampling} "
+                f"recall={recall:.4f} p50={p50:.3f}ms",
+                flush=True,
+            )
             results.append(
                 {
                     "hnsw_ef": ef,
                     "oversampling": oversampling,
-                    "recall": recall_at_k(ids, gt),
+                    "recall": recall,
                     "p50_ms": p50,
                 }
             )
@@ -976,8 +990,13 @@ def calibrate_pgvector(
                 ids.append(found)
                 latencies.append(client_ms)
             p50, _, _ = latency_stats(latencies)
+            recall = recall_at_k(ids, gt)
+            print(
+                f"  [calib][pgvector] ef={ef} recall={recall:.4f} p50={p50:.3f}ms",
+                flush=True,
+            )
             results.append(
-                {"hnsw_ef_search": ef, "recall": recall_at_k(ids, gt), "p50_ms": p50}
+                {"hnsw_ef_search": ef, "recall": recall, "p50_ms": p50}
             )
     return results
 
@@ -1007,7 +1026,12 @@ def measure_generic(
             warmup_fn(query, cfg)
 
         round_stats: List[Dict[str, Any]] = []
-        for _ in range(rounds):
+        for round_idx in range(rounds):
+            print(
+                f"  [measure] target={target:.3f} round={round_idx + 1}/{rounds} "
+                f"queries={len(prepared_queries if prepared_queries is not None else test_queries)}",
+                flush=True,
+            )
             ids: List[List[int]] = []
             latencies: List[float] = []
             server_latencies: List[float] = []
@@ -1028,10 +1052,18 @@ def measure_generic(
             cs50, cs95, cs99 = latency_stats(c_server)
             qps = (len(source) / wall_s) if wall_s > 0 else 0.0
 
+            round_recall = recall_at_k(ids, test_gt)
+            round_concurrent_recall = recall_at_k(c_ids, test_gt)
+            print(
+                f"  [measure] target={target:.3f} round={round_idx + 1}/{rounds} "
+                f"recall={round_recall:.4f} concurrent_recall={round_concurrent_recall:.4f} "
+                f"p50={p50:.3f}ms qps={qps:.1f}",
+                flush=True,
+            )
             round_stats.append(
                 {
-                    "recall": recall_at_k(ids, test_gt),
-                    "concurrent_recall": recall_at_k(c_ids, test_gt),
+                    "recall": round_recall,
+                    "concurrent_recall": round_concurrent_recall,
                     "p50": p50,
                     "p95": p95,
                     "p99": p99,

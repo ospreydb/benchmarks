@@ -114,6 +114,12 @@ Fairness caveats:
 - There is no CPU pinning or cgroup isolation; run on an idle machine for publication
   numbers. Cohere 768d at 100k is the supported scale in this repository.
 
+The full SIFT1M + Cohere run rebuilds four indexes and calibrates an on-disk HNSW index, so
+it takes tens of minutes on a spinning disk. Progress is printed per calibration
+configuration and per measurement round; the Python entrypoint line-buffers stdout even
+when piped through `tee`. Use `--quick` or restrict `--datasets`/`--engines` for a fast
+sanity check.
+
 ```bash
 # Build both binaries against the local core checkout.
 make build-rust OSPREY_SRC=/home/ramos/repositories/ospreydb/ospreydb

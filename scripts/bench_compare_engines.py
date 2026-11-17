@@ -371,6 +371,11 @@ def bench_pgvector(
 
 
 def main() -> int:
+    # Keep progress visible when stdout is piped (e.g. `make ... | tee run.log`).
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(line_buffering=True)
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--datasets", nargs="+", default=["sift1m", "cohere768d"])
     parser.add_argument("--osprey-bin", required=True)
