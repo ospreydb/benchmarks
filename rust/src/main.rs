@@ -317,16 +317,24 @@ fn read_npy_2d_raw(path: &Path) -> Result<(Vec<usize>, String, Vec<u8>), String>
 }
 
 fn extract_dict_str(hdr: &str, key: &str) -> Result<String, String> {
-    let pos = hdr.find(key).ok_or_else(|| format!("missing {key} in {hdr}"))?;
+    let pos = hdr
+        .find(key)
+        .ok_or_else(|| format!("missing {key} in {hdr}"))?;
     let after = &hdr[pos + key.len()..];
-    let q1 = after.find('\'').ok_or_else(|| "missing quote".to_string())?;
+    let q1 = after
+        .find('\'')
+        .ok_or_else(|| "missing quote".to_string())?;
     let rest = &after[q1 + 1..];
-    let q2 = rest.find('\'').ok_or_else(|| "missing end quote".to_string())?;
+    let q2 = rest
+        .find('\'')
+        .ok_or_else(|| "missing end quote".to_string())?;
     Ok(rest[..q2].to_string())
 }
 
 fn extract_shape(hdr: &str) -> Result<Vec<usize>, String> {
-    let pos = hdr.find("'shape'").ok_or_else(|| "missing shape".to_string())?;
+    let pos = hdr
+        .find("'shape'")
+        .ok_or_else(|| "missing shape".to_string())?;
     let after = &hdr[pos..];
     let p1 = after.find('(').ok_or_else(|| "missing (".to_string())?;
     let p2 = after.find(')').ok_or_else(|| "missing )".to_string())?;
@@ -344,7 +352,11 @@ fn extract_shape(hdr: &str) -> Result<Vec<usize>, String> {
 fn load_f32_matrix(path: &Path) -> Result<(usize, usize, Vec<f32>), String> {
     let (shape, descr, data) = read_npy_2d_raw(path)?;
     if shape.len() != 2 {
-        return Err(format!("expected 2D matrix in {}, got {:?}", path.display(), shape));
+        return Err(format!(
+            "expected 2D matrix in {}, got {:?}",
+            path.display(),
+            shape
+        ));
     }
     if descr != "<f4" && descr != "f4" {
         return Err(format!("expected <f4 in {}, got {descr}", path.display()));
@@ -364,7 +376,11 @@ fn load_f32_matrix(path: &Path) -> Result<(usize, usize, Vec<f32>), String> {
 fn load_i64_matrix(path: &Path) -> Result<(usize, usize, Vec<i64>), String> {
     let (shape, descr, data) = read_npy_2d_raw(path)?;
     if shape.len() != 2 {
-        return Err(format!("expected 2D matrix in {}, got {:?}", path.display(), shape));
+        return Err(format!(
+            "expected 2D matrix in {}, got {:?}",
+            path.display(),
+            shape
+        ));
     }
     let rows = shape[0];
     let cols = shape[1];
@@ -382,7 +398,10 @@ fn load_i64_matrix(path: &Path) -> Result<(usize, usize, Vec<i64>), String> {
             ])));
         }
     } else {
-        return Err(format!("unsupported int dtype {descr} in {}", path.display()));
+        return Err(format!(
+            "unsupported int dtype {descr} in {}",
+            path.display()
+        ));
     }
     Ok((rows, cols, out))
 }
@@ -399,7 +418,10 @@ async fn load_osv_metadata(
     store: &Arc<dyn ObjectStore>,
     obj_path: &ObjectPath,
 ) -> Result<(Vec<MinipageDirectoryEntry>, Option<Vec<u8>>, u64), String> {
-    let meta = store.head(obj_path).await.map_err(|e| format!("head: {e}"))?;
+    let meta = store
+        .head(obj_path)
+        .await
+        .map_err(|e| format!("head: {e}"))?;
     let osv_size = u64::try_from(meta.size).unwrap_or(0);
 
     let hdr_bytes = store
@@ -486,8 +508,7 @@ fn run_server(
         .build()
         .map_err(|e| e.to_string())?;
 
-    let (directory, zstd_dict, _osv_bytes) =
-        rt.block_on(load_osv_metadata(&store, &obj_path))?;
+    let (directory, zstd_dict, _osv_bytes) = rt.block_on(load_osv_metadata(&store, &obj_path))?;
 
     let warp_cfg = if no_warp {
         WarpConfig {
@@ -556,15 +577,15 @@ fn run_search_eval(
 
     let slabs_uri = normalize_slabs_uri(slabs)?;
     let remote_cfg = RemoteStoreConfig::default();
-    let (store, obj_path) = build_object_store(&slabs_uri, &remote_cfg).map_err(|e| e.to_string())?;
+    let (store, obj_path) =
+        build_object_store(&slabs_uri, &remote_cfg).map_err(|e| e.to_string())?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
 
-    let (directory, zstd_dict, osv_bytes) =
-        rt.block_on(load_osv_metadata(&store, &obj_path))?;
+    let (directory, zstd_dict, osv_bytes) = rt.block_on(load_osv_metadata(&store, &obj_path))?;
 
     let warp_cfg = if no_warp {
         WarpConfig {
@@ -807,19 +828,9 @@ fn run_lutrank_eval(
             let rels: Vec<f64> = scored
                 .iter()
                 .take(top_k)
-                .map(|(did, _)| {
-                    q.qrels
-                        .get(&did.to_string())
-                        .copied()
-                        .unwrap_or(0)
-                        .max(0) as f64
-                })
+                .map(|(did, _)| q.qrels.get(&did.to_string()).copied().unwrap_or(0).max(0) as f64)
                 .collect();
-            let mut ideal_rels: Vec<f64> = q
-                .qrels
-                .values()
-                .map(|&v| v.max(0) as f64)
-                .collect();
+            let mut ideal_rels: Vec<f64> = q.qrels.values().map(|&v| v.max(0) as f64).collect();
             ideal_rels.sort_by(f64::total_cmp);
             ideal_rels.reverse();
 

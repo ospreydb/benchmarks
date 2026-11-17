@@ -29,7 +29,7 @@ help:
 	@echo "  make bench-pareto-adaptive  SIFT1M Pareto sweep for refine_multiplier 1 and 0"
 	@echo "  make profile-perf   Run perf stat / flamegraphs / ISA audit"
 	@echo "  make plots          Generate academic SVG figures in results/figures/"
-	@echo "  make bench-all      Run the full end-to-end benchmark & artifact pipeline"
+	@echo "  make bench-all      Run the full end-to-end benchmark & artifact pipeline (incl. controlled)"
 
 setup:
 	python3 -m venv --system-site-packages $(CURDIR)/.venv
@@ -125,7 +125,7 @@ profile-perf:
 plots:
 	$(PYTHON) $(CURDIR)/scripts/generate_plots.py
 
-bench-all: build-rust datasets minio-up bench-compare bench-lutrank bench-pareto profile-perf plots
+bench-all: build-rust datasets minio-up bench-compare bench-compare-controlled bench-lutrank bench-pareto profile-perf plots
 	@echo "=== All benchmarks complete! Raw CSVs, perf logs, and SVGs written to results/ ==="
 	@ls -lh $(CURDIR)/results/ $(CURDIR)/results/figures/ $(CURDIR)/results/perf/
 

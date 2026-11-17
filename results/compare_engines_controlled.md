@@ -128,11 +128,12 @@ filtered-out row.
 
 ## Caveats
 
-- **Qdrant disk is an upper bound:** `disk_size_mb` is sampled at the end of the
-  Qdrant stage, before background compaction finishes. The post-run Cohere FP32
-  collection directory is `804 MiB`, versus `1368 MiB` in the CSV; the BQ data
-  directory is `355 MiB`. The OspreyDB disk advantage is larger than the table
-  suggests.
+- **Qdrant disk is an upper bound:** this CSV was produced before the harness
+  was changed to sample Qdrant disk after shutdown; the values here were taken
+  before background compaction finished. The post-run Cohere FP32 collection
+  directory is `804 MiB`, versus `1368 MiB` in the CSV; the BQ data directory is
+  `355 MiB`. Future runs measure after shutdown. The OspreyDB disk advantage is
+  larger than the table suggests.
 - **OspreyDB SIFT `0.97` status:** validation `0.9680` is below target, so the
   row is `below_target`; test recall `0.9738` meets the target. The status is
   conservative, not a failure.

@@ -9,6 +9,7 @@ Generates:
   4. fig4_pareto_recall_latency_s3.svg : Pareto curve Recall@10 vs Latency (ms) vs S3 Requests
 """
 
+import argparse
 import csv
 from pathlib import Path
 from typing import Dict, List
@@ -257,6 +258,10 @@ def plot_fig4_pareto() -> None:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Generate publication SVG figures from benchmark CSVs."
+    )
+    parser.parse_args()
     FIG_DIR.mkdir(parents=True, exist_ok=True)
     plot_fig1_ram_reduction()
     plot_fig2_warp_s3()

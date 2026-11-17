@@ -1642,9 +1642,11 @@ def run_controlled(args: Any) -> int:
                 )
             finally:
                 query_peak_kb = container_peak_memory_kb("osprey-bench-qdrant")
-            disk_mb = fp32.disk_mb(coll)
             fp32.close()
             stop_qdrant_fp32()
+            # Read on-disk size after shutdown so background compaction has
+            # settled; sampling before stop overstates the collection size.
+            disk_mb = fp32.disk_mb(coll)
             for target, stats in measured.items():
                 rows.append(
                     build_row(
@@ -1732,9 +1734,9 @@ def run_controlled(args: Any) -> int:
                 )
             finally:
                 query_peak_kb = container_peak_memory_kb(QDRANT_BQ_NAME)
-            disk_mb = bq.disk_mb(coll)
             bq.close()
             stop_qdrant_bq_container()
+            disk_mb = bq.disk_mb(coll)
             for target, stats in measured.items():
                 rows.append(
                     build_row(

@@ -205,3 +205,7 @@ make bench-pareto-adaptive
 - `results/lutrank_vs_colbert.csv` — `LUT-Rank` CPU vs. ColBERTv2 latency, QPS, `NDCG@10`, and `MRR@10`.
 - `results/perf/` — `perf stat` / `rusage` logs, ISA disassembly counts, and flamegraph status.
 - `results/figures/` — Vector SVG figures (`fig1_ram_reduction_60x.svg`, `fig2_warp_s3_requests_16x.svg`, `fig3_lutrank_cpu_vs_gpu.svg`, `fig4_pareto_recall_latency_s3.svg`).
+
+## 4. License
+
+Apache-2.0. See [`LICENSE`](LICENSE).
