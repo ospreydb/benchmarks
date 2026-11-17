@@ -1,7 +1,7 @@
-dataset,engine,build_time_s,peak_rss_mb,build_peak_rss_mb,ram_index_mb,disk_size_mb,recall_at_10,p50_ms,p95_ms,p99_ms,qps
-sift1m,OspreyDB (1-bit .osi + .osv),9.285,86.66,480.71,9.62,51.49,0.843,0.827,1.446,2.402,1106.9
-sift1m,Qdrant (HNSW FP32),13.332,734.1,734.1,634.25,1419.45,1.0,1.011,1.179,1.354,962.3
-sift1m,pgvector (HNSW),23.59,192.4,192.4,198.41,343.46,0.9845,1.273,2.319,2.604,737.2
-cohere768d,OspreyDB (1-bit .osi + .osv),32.984,192.3,1284.11,15.01,151.07,0.9655,1.458,2.521,3.748,634.9
-cohere768d,Qdrant (HNSW FP32),57.878,614.9,614.9,513.0,3154.73,0.9895,1.647,1.919,2.195,598.3
-cohere768d,pgvector (HNSW),60.561,209.5,209.5,390.62,793.85,0.9725,1.896,3.47,4.119,467.0
+dataset,engine,build_time_s,peak_rss_mb,build_peak_rss_mb,ram_index_mb,disk_size_mb,recall_at_10,p50_ms,p95_ms,p99_ms,qps,refine_policy,requested_refine_multiplier,refine_multiplier,orig_dim,requested_nprobe,effective_nprobe,requested_candidates,effective_candidates,refine_limit,stage1_limit,low_dim_oversample,auto_candidates,candidates_mode
+sift1m,OspreyDB (1-bit .osi + .osv),20.052,294.08,431.5,38.23,212.93,0.969,12.504,18.194,21.946,80.7,adaptive,0,2,128,32,64,0,4000,128,4000,True,True,auto
+sift1m,Qdrant (HNSW FP32),116.842,540.3,540.3,451.38,1050.51,0.9975,1.199,1.605,1.971,720.2,,,,,,,,,,,,,
+sift1m,pgvector (HNSW),337.575,255.8,255.8,781.91,1361.65,0.971,2.872,4.993,283.853,115.4,,,,,,,,,,,,,
+cohere768d,OspreyDB (1-bit .osi + .osv),22.13,158.59,691.37,15.01,151.85,0.9695,1.455,2.359,3.212,650.3,adaptive,0,1,768,32,32,0,300,10,300,False,True,auto
+cohere768d,Qdrant (HNSW FP32),55.282,760.1,760.1,634.9,3285.42,0.9905,1.921,2.435,2.673,474.6,,,,,,,,,,,,,
+cohere768d,pgvector (HNSW),105.914,231.8,231.8,390.62,793.86,0.971,2.213,4.068,4.711,404.3,,,,,,,,,,,,,

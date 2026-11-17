@@ -104,28 +104,19 @@ def measure_cmd_peak_rss(cmd: List[str], env: Optional[Dict[str, str]] = None) -
     return elapsed, 0.0
 
 
-def bench_osprey(
-    dataset: str,
+def build_osprey_index(
     ds_dir: Path,
     osprey_bin: str,
-    runner_bin: str,
     clusters: int,
-    nprobe: int,
-    refine_m: int,
-    max_queries: int,
-) -> Dict[str, object]:
-    art_dir = ARTIFACTS_DIR / "compare" / dataset
+    art_dir: Path,
+) -> Tuple[float, float]:
     art_dir.mkdir(parents=True, exist_ok=True)
-    parquet_path = ds_dir / "base.parquet"
-    queries_npy = ds_dir / "queries.npy"
-    gt_npy = ds_dir / "gt_ip.npy"
-
     build_s, build_rss_mb = measure_cmd_peak_rss(
         [
             osprey_bin,
             "import",
             "--input",
-            str(parquet_path),
+            str(ds_dir / "base.parquet"),
             "--output",
             str(art_dir),
             "--id-col",
@@ -137,8 +128,25 @@ def bench_osprey(
             "--json",
         ]
     )
+    return build_s, build_rss_mb
 
-    out_json = art_dir / "osprey_eval.json"
+
+def eval_osprey(
+    dataset: str,
+    ds_dir: Path,
+    runner_bin: str,
+    art_dir: Path,
+    nprobe: int,
+    refine_m: int,
+    refine_multiplier: int,
+    max_queries: int,
+    build_s: float,
+    build_rss_mb: float,
+) -> Dict[str, object]:
+    queries_npy = ds_dir / "queries.npy"
+    gt_npy = ds_dir / "gt_ip.npy"
+
+    out_json = art_dir / f"osprey_eval_rm{refine_multiplier}.json"
     subprocess.run(
         [
             runner_bin,
@@ -155,6 +163,8 @@ def bench_osprey(
             str(nprobe),
             "--refine-list",
             str(refine_m),
+            "--refine-multiplier",
+            str(refine_multiplier),
             "--top-k",
             "10",
             "--max-queries",
@@ -170,6 +180,13 @@ def bench_osprey(
     osi_mb = res["osi_bytes"] / (1024.0 * 1024.0)
     osv_mb = res["osv_bytes"] / (1024.0 * 1024.0)
 
+    if refine_multiplier == 0:
+        refine_policy = "adaptive"
+    elif refine_multiplier == 1:
+        refine_policy = "baseline"
+    else:
+        refine_policy = f"forced-{refine_multiplier}"
+
     return {
         "dataset": dataset,
         "engine": "OspreyDB (1-bit .osi + .osv)",
@@ -183,6 +200,19 @@ def bench_osprey(
         "p95_ms": round(res["p95_ms"], 3),
         "p99_ms": round(res["p99_ms"], 3),
         "qps": round(res["qps"], 1),
+        "refine_policy": refine_policy,
+        "requested_refine_multiplier": refine_multiplier,
+        "refine_multiplier": res["refine_multiplier"],
+        "orig_dim": res["orig_dim"],
+        "requested_nprobe": res["requested_nprobe"],
+        "effective_nprobe": res["effective_nprobe"],
+        "requested_candidates": res["requested_candidates"],
+        "effective_candidates": res["effective_candidates"],
+        "refine_limit": res["refine_limit"],
+        "stage1_limit": res["stage1_limit"],
+        "low_dim_oversample": res["low_dim_oversample"],
+        "auto_candidates": res["auto_candidates"],
+        "candidates_mode": "auto" if res["auto_candidates"] else "explicit",
     }
 
 
@@ -347,14 +377,39 @@ def main() -> int:
     parser.add_argument("--runner-bin", required=True)
     parser.add_argument("--clusters", type=int, default=256)
     parser.add_argument("--nprobe", type=int, default=32)
-    parser.add_argument("--refine-m", type=int, default=300)
+    parser.add_argument(
+        "--refine-m",
+        type=int,
+        default=None,
+        help=(
+            "Explicit Stage-1 candidate pool. Omit to use the adaptive auto default "
+            "(2000 for dim<=256, 300 otherwise)."
+        ),
+    )
+    parser.add_argument(
+        "--refine-multiplier",
+        type=int,
+        nargs="+",
+        default=[0],
+        help=(
+            "Adaptive oversampling policy: 0 = adaptive (2x + 128 f16 floor for dim<=256), "
+            "1 = disabled/baseline, N>1 = forced Nx. May pass several values to run an A/B sweep."
+        ),
+    )
     parser.add_argument("--max-queries", type=int, default=200)
+    parser.add_argument(
+        "--out-csv",
+        default=str(RESULTS_DIR / "compare_engines.csv"),
+        help="Output CSV (use results/compare_engines_adaptive.csv to preserve the published file).",
+    )
     parser.add_argument("--skip-pgvector", action="store_true")
     parser.add_argument("--skip-qdrant", action="store_true")
     args = parser.parse_args()
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     rows: List[Dict[str, object]] = []
+    refine_m = args.refine_m if args.refine_m is not None else 0
+    refine_m_label = "auto" if refine_m == 0 else str(refine_m)
 
     for ds in args.datasets:
         ds_dir = PREP_DIR / ds
@@ -362,19 +417,32 @@ def main() -> int:
             print(f"[skip] {ds}: {ds_dir / 'base.npy'} not found")
             continue
 
-        print(f"=== Benchmarking OspreyDB on {ds} ===")
-        rows.append(
-            bench_osprey(
-                ds,
-                ds_dir,
-                args.osprey_bin,
-                args.runner_bin,
-                args.clusters,
-                args.nprobe,
-                args.refine_m,
-                args.max_queries,
-            )
+        art_dir = ARTIFACTS_DIR / "compare" / ds
+        print(f"=== Building OspreyDB index on {ds} ===")
+        build_s, build_rss_mb = build_osprey_index(
+            ds_dir, args.osprey_bin, args.clusters, art_dir
         )
+
+        for refine_multiplier in args.refine_multiplier:
+            print(
+                f"=== Benchmarking OspreyDB on {ds} "
+                f"(nprobe={args.nprobe}, refine_m={refine_m_label}, "
+                f"refine_multiplier={refine_multiplier}) ==="
+            )
+            rows.append(
+                eval_osprey(
+                    ds,
+                    ds_dir,
+                    args.runner_bin,
+                    art_dir,
+                    args.nprobe,
+                    refine_m,
+                    refine_multiplier,
+                    args.max_queries,
+                    build_s,
+                    build_rss_mb,
+                )
+            )
 
         if not args.skip_qdrant:
             print(f"=== Benchmarking Qdrant on {ds} ===")
@@ -384,15 +452,21 @@ def main() -> int:
             print(f"=== Benchmarking pgvector on {ds} ===")
             rows.append(bench_pgvector(ds, ds_dir, args.max_queries))
 
-    out_csv = RESULTS_DIR / "compare_engines.csv"
+    out_csv = Path(args.out_csv)
     if rows:
-        fieldnames = list(rows[0].keys())
+        fieldnames: List[str] = []
+        for r in rows:
+            for key in r:
+                if key not in fieldnames:
+                    fieldnames.append(key)
+        normalized = [{k: r.get(k, "") for k in fieldnames} for r in rows]
+        out_csv.parent.mkdir(parents=True, exist_ok=True)
         with open(out_csv, "w", newline="", encoding="utf-8") as fh:
             writer = csv.DictWriter(fh, fieldnames=fieldnames)
             writer.writeheader()
-            writer.writerows(rows)
+            writer.writerows(normalized)
         print(f"[saved] {out_csv}")
-        for r in rows:
+        for r in normalized:
             print(r)
     return 0
 

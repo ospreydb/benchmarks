@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 PYTHON ?= $(CURDIR)/.venv/bin/python3
 PIP ?= $(CURDIR)/.venv/bin/pip
-OSPREY_SRC ?= $(abspath $(CURDIR)/../osprey/phase-14)
+OSPREY_SRC ?= /home/ramos/repositories/ospreydb/ospreydb
 OSPREY_BIN ?= $(OSPREY_SRC)/target/release/osprey
 RUNNER_BIN := $(CURDIR)/rust/target/release/osprey-bench-runner
 COMPOSE_FILE := $(CURDIR)/docker/docker-compose.yml
@@ -11,18 +11,21 @@ COMPARE_DATASETS ?= sift1m cohere768d
 LUTRANK_DATASETS ?= scifact fiqa msmarco
 PARETO_DATASET ?= sift1m
 
-.PHONY: help setup build-rust datasets minio-up minio-down bench-compare bench-lutrank bench-pareto profile-perf plots bench-all clean
+.PHONY: help setup build-rust datasets minio-up minio-down bench-compare bench-compare-adaptive bench-lutrank bench-pareto bench-pareto-adaptive profile-perf plots bench-all clean
 
 help:
 	@echo "OspreyDB Reproducible Benchmark Suite"
 	@echo "  make setup          Create Python .venv and install dependencies"
 	@echo "  make build-rust     Compile osprey CLI and osprey-bench-runner (--release, target-cpu=native)"
+	@echo "                      Override the core checkout with OSPREY_SRC=/path/to/ospreydb/ospreydb"
 	@echo "  make datasets       Download and prepare public datasets (SIFT1M, Cohere768d, SciFact, FiQA, MS MARCO)"
 	@echo "  make minio-up       Start MinIO (tc netem 15ms), Qdrant, and pgvector containers"
 	@echo "  make minio-down     Stop benchmark containers"
 	@echo "  make bench-compare  Run OspreyDB vs Qdrant vs pgvector comparison"
+	@echo "  make bench-compare-adaptive  SIFT1M A/B: refine_multiplier 1 (baseline) vs 0 (adaptive)"
 	@echo "  make bench-lutrank  Run LUT-Rank CPU vs ColBERTv2 benchmark"
 	@echo "  make bench-pareto   Run WaRP Pareto sweep over MinIO + tc netem"
+	@echo "  make bench-pareto-adaptive  SIFT1M Pareto sweep for refine_multiplier 1 and 0"
 	@echo "  make profile-perf   Run perf stat / flamegraphs / ISA audit"
 	@echo "  make plots          Generate academic SVG figures in results/figures/"
 	@echo "  make bench-all      Run the full end-to-end benchmark & artifact pipeline"
@@ -39,7 +42,9 @@ build-rust:
 			--config 'patch."https://github.com/ospreydb/ospreydb.git".osprey-simd.path="$(OSPREY_SRC)/crates/osprey-simd"' \
 			--config 'patch."https://github.com/ospreydb/ospreydb.git".osprey-storage.path="$(OSPREY_SRC)/crates/osprey-storage"'; \
 	else \
-		RUSTFLAGS="-C target-cpu=native" cargo build --manifest-path $(CURDIR)/rust/Cargo.toml --release; \
+		echo "error: $(OSPREY_SRC) does not contain crates/osprey-core" >&2; \
+		echo "       pass OSPREY_SRC=/path/to/ospreydb/ospreydb (commit 2e8e2f3 or newer)" >&2; \
+		exit 1; \
 	fi
 
 datasets:
@@ -61,6 +66,21 @@ bench-compare:
 		--osprey-bin $(OSPREY_BIN) \
 		--runner-bin $(RUNNER_BIN)
 
+# Isolated SIFT1M A/B for the adaptive low-dimensional oversampling policy.
+# baseline: nprobe=8, refine_m=64, refine_multiplier=1  -> 8/64,  low_dim_oversample=false
+# adaptive: nprobe=8, refine_m=64, refine_multiplier=0  -> 16/128, low_dim_oversample=true
+bench-compare-adaptive:
+	$(PYTHON) $(CURDIR)/scripts/bench_compare_engines.py \
+		--datasets sift1m \
+		--nprobe 8 \
+		--refine-m 64 \
+		--refine-multiplier 1 0 \
+		--skip-qdrant \
+		--skip-pgvector \
+		--osprey-bin $(OSPREY_BIN) \
+		--runner-bin $(RUNNER_BIN) \
+		--out-csv $(CURDIR)/results/compare_engines_adaptive.csv
+
 bench-lutrank:
 	$(PYTHON) $(CURDIR)/scripts/bench_lutrank_vs_colbert.py \
 		--datasets $(LUTRANK_DATASETS) \
@@ -72,6 +92,15 @@ bench-pareto:
 		--dataset $(PARETO_DATASET) \
 		--osprey-bin $(OSPREY_BIN) \
 		--runner-bin $(RUNNER_BIN)
+
+# SIFT1M Pareto sweep for the published baseline (multiplier=1) and adaptive (0) policies.
+bench-pareto-adaptive:
+	$(PYTHON) $(CURDIR)/scripts/bench_pareto_s3.py \
+		--dataset sift1m \
+		--refine-multiplier 1 0 \
+		--osprey-bin $(OSPREY_BIN) \
+		--runner-bin $(RUNNER_BIN) \
+		--out-csv $(CURDIR)/results/pareto_s3_adaptive.csv
 
 profile-perf:
 	chmod +x $(CURDIR)/scripts/profile_perf.sh

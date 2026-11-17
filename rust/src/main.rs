@@ -12,7 +12,7 @@ use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use osprey_core::{
     cast_minipage_directory, AlignedBuffer, MinipageDirectoryEntry, OsiIndex, OsiMappedView,
-    OspreyError, OsrStore, OsvHeader, QuantizedQueryLut,
+    OspreyError, OsrStore, OsvHeader, QuantizedQueryLut, SearchOptions,
 };
 use osprey_simd::{SimdBackend, SimdEngine};
 use osprey_storage::{
@@ -41,8 +41,13 @@ enum Cmd {
         gt_npy: PathBuf,
         #[arg(long, default_value = "16")]
         nprobe_list: String,
+        /// Comma-separated Stage-1 candidate pools. `0` selects the policy default
+        /// (2000 for `orig_dim <= 256`, 300 otherwise).
         #[arg(long, default_value = "200")]
         refine_list: String,
+        /// `0` = adaptive (2x + 128 f16 floor when dim <= 256), `1` = disabled, `N > 1` = forced Nx.
+        #[arg(long, default_value_t = 0)]
+        refine_multiplier: usize,
         #[arg(long, default_value_t = 10)]
         top_k: usize,
         #[arg(long, default_value_t = 100)]
@@ -75,6 +80,16 @@ enum Cmd {
 struct SearchEvalPoint {
     nprobe: usize,
     refine_m: usize,
+    requested_nprobe: usize,
+    effective_nprobe: usize,
+    requested_candidates: usize,
+    effective_candidates: usize,
+    refine_limit: usize,
+    stage1_limit: usize,
+    refine_multiplier: usize,
+    low_dim_oversample: bool,
+    auto_candidates: bool,
+    orig_dim: u16,
     warp_enabled: bool,
     queries_evaluated: usize,
     recall_at_10: f64,
@@ -206,7 +221,7 @@ fn load_f32_matrix(path: &Path) -> Result<(usize, usize, Vec<f32>), String> {
         return Err("truncated f32 npy data".to_string());
     }
     let mut out = Vec::with_capacity(rows * cols);
-    for chunk in data[..rows * cols * 4].chunks_exact(4) {
+    for chunk in data[..rows * cols * 4].as_chunks::<4>().0 {
         out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
     Ok((rows, cols, out))
@@ -221,13 +236,13 @@ fn load_i64_matrix(path: &Path) -> Result<(usize, usize, Vec<i64>), String> {
     let cols = shape[1];
     let mut out = Vec::with_capacity(rows * cols);
     if descr == "<i8" || descr == "i8" {
-        for chunk in data[..rows * cols * 8].chunks_exact(8) {
+        for chunk in data[..rows * cols * 8].as_chunks::<8>().0 {
             out.push(i64::from_le_bytes([
                 chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
             ]));
         }
     } else if descr == "<i4" || descr == "i4" {
-        for chunk in data[..rows * cols * 4].chunks_exact(4) {
+        for chunk in data[..rows * cols * 4].as_chunks::<4>().0 {
             out.push(i64::from(i32::from_le_bytes([
                 chunk[0], chunk[1], chunk[2], chunk[3],
             ])));
@@ -314,6 +329,7 @@ fn normalize_slabs_uri(slabs: &str) -> Result<String, String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_search_eval(
     osi_path: &Path,
     slabs: &str,
@@ -321,6 +337,7 @@ fn run_search_eval(
     gt_npy: &Path,
     nprobe_list: &[usize],
     refine_list: &[usize],
+    refine_multiplier: usize,
     top_k: usize,
     max_queries: usize,
     cache_mb: usize,
@@ -334,6 +351,7 @@ fn run_search_eval(
     let mmap = unsafe { Mmap::map(&file).map_err(|e| e.to_string())? };
     let _view = OsiMappedView::from_bytes(&mmap).map_err(|e| e.to_string())?;
     let osi = OsiIndex::from_bytes(&mmap).map_err(|e| e.to_string())?;
+    let orig_dim = osi.header().orig_dim;
 
     let (num_q, q_dim, q_flat) = load_f32_matrix(queries_npy)?;
     let (gt_rows, gt_cols, gt_flat) = load_i64_matrix(gt_npy)?;
@@ -366,6 +384,15 @@ fn run_search_eval(
     let mut results = Vec::new();
     for &nprobe in nprobe_list {
         for &refine_m in refine_list {
+            let plan = SearchOptions {
+                nprobe,
+                candidates: refine_m,
+                top_k,
+                rerank_top_m: 0,
+                refine_multiplier,
+            }
+            .resolve(orig_dim);
+
             let cache_bytes = cache_mb.saturating_mul(1024 * 1024);
             let cache = MinipageLruCache::new(cache_bytes);
 
@@ -385,7 +412,7 @@ fn run_search_eval(
                 let t0 = Instant::now();
                 let t_s1 = Instant::now();
                 let stage1_hits = osi
-                    .search_candidates(q, nprobe, refine_m.max(top_k), &simd)
+                    .search_candidates(q, plan.effective_nprobe, plan.stage1_limit, &simd)
                     .map_err(|e| e.to_string())?;
                 let s1_ms = t_s1.elapsed().as_secs_f64() * 1000.0;
 
@@ -439,6 +466,16 @@ fn run_search_eval(
             results.push(SearchEvalPoint {
                 nprobe,
                 refine_m,
+                requested_nprobe: nprobe,
+                effective_nprobe: plan.effective_nprobe,
+                requested_candidates: refine_m,
+                effective_candidates: plan.effective_candidates,
+                refine_limit: plan.refine_limit,
+                stage1_limit: plan.stage1_limit,
+                refine_multiplier: plan.refine_multiplier,
+                low_dim_oversample: plan.low_dim_oversample,
+                auto_candidates: refine_m == 0,
+                orig_dim,
                 warp_enabled: !no_warp,
                 queries_evaluated: q_count,
                 recall_at_10: (recall_hits as f64) / (recall_denom.max(1) as f64),
@@ -640,6 +677,7 @@ fn main() -> Result<(), String> {
             gt_npy,
             nprobe_list,
             refine_list,
+            refine_multiplier,
             top_k,
             max_queries,
             cache_mb,
@@ -655,6 +693,7 @@ fn main() -> Result<(), String> {
                 &gt_npy,
                 &nprobes,
                 &refines,
+                refine_multiplier,
                 top_k,
                 max_queries,
                 cache_mb,
