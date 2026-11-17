@@ -27,7 +27,11 @@ make setup
 #    (commit 2e8e2f3 "feat(core): centralize adaptive low-dim oversampling policy").
 make build-rust OSPREY_SRC=/home/ramos/repositories/ospreydb/ospreydb
 
-# 3. Run the complete benchmark suite (datasets -> Docker/MinIO -> engines -> LUT-Rank -> Pareto -> perf -> SVGs)
+# 2b. Optional local checks (Python syntax, rustfmt, compose config)
+make check
+
+# 3. Run the complete benchmark suite (datasets -> Docker/MinIO -> engines ->
+#    controlled run -> LUT-Rank -> Pareto -> perf -> SVGs)
 make bench-all
 ```
 

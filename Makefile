@@ -11,11 +11,12 @@ COMPARE_DATASETS ?= sift1m cohere768d
 LUTRANK_DATASETS ?= scifact fiqa msmarco
 PARETO_DATASET ?= sift1m
 
-.PHONY: help setup build-rust datasets minio-up minio-down bench-compare bench-compare-controlled bench-compare-adaptive bench-lutrank bench-pareto bench-pareto-adaptive profile-perf plots bench-all clean
+.PHONY: help setup check build-rust datasets minio-up minio-down bench-compare bench-compare-controlled bench-compare-adaptive bench-lutrank bench-pareto bench-pareto-adaptive profile-perf plots bench-all clean
 
 help:
 	@echo "OspreyDB Reproducible Benchmark Suite"
 	@echo "  make setup          Create Python .venv and install dependencies"
+	@echo "  make check          Python syntax, rustfmt, and compose config checks"
 	@echo "  make build-rust     Compile osprey CLI and osprey-bench-runner (--release, target-cpu=native)"
 	@echo "                      Override the core checkout with OSPREY_SRC=/path/to/ospreydb/ospreydb"
 	@echo "  make datasets       Download and prepare public datasets (SIFT1M, Cohere768d, SciFact, FiQA, MS MARCO)"
@@ -34,6 +35,11 @@ help:
 setup:
 	python3 -m venv --system-site-packages $(CURDIR)/.venv
 	$(PIP) install -r $(CURDIR)/requirements.txt
+
+check:
+	$(PYTHON) -m compileall -q $(CURDIR)/scripts
+	cargo fmt --manifest-path $(CURDIR)/rust/Cargo.toml --all -- --check
+	docker compose -f $(COMPOSE_FILE) config -q
 
 build-rust:
 	@if [ -d "$(OSPREY_SRC)/crates/osprey-core" ]; then \
