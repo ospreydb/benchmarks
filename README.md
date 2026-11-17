@@ -156,6 +156,26 @@ make bench-compare-controlled
   --out-controlled-csv results/compare_engines_controlled.csv
 ```
 
+### Controlled results (2026-11-17)
+
+Published run: [`results/compare_engines_controlled.md`](results/compare_engines_controlled.md),
+raw data in [`results/compare_engines_controlled.csv`](results/compare_engines_controlled.csv).
+
+- **SIFT1M:** Qdrant FP32 is `3.5–3.9x` faster than OspreyDB in client P50
+  (`0.85–0.89 ms` vs `2.98–3.43 ms`), but uses `9.1x` more peak memory
+  (`4194 MiB` vs `462 MiB`) and `4.1x` more disk (`868 MiB` vs `213 MiB`).
+  pgvector matches OspreyDB latency (`2.37–3.26 ms`) with higher QPS, but uses
+  `2594 MiB` peak memory and `2144 MiB` disk.
+- **Cohere 100k:** OspreyDB (`0.80–0.97 ms`, `235 MiB`, `152 MiB` disk) and
+  Qdrant FP32 (`0.70–0.86 ms`, `2731 MiB`, `~804 MiB` disk after compaction)
+  are close in latency; OspreyDB uses `11.6x` less peak memory and `~5x` less
+  disk.
+- **Quantization:** Qdrant 1-bit BQ does not reach `0.95` on either dataset
+  (`0.062` SIFT test recall, `0.934` Cohere). OspreyDB's 1-bit RaBitQ + f16
+  rescore reaches `0.974` (SIFT) and `0.989` (Cohere).
+- **Calibration note:** OspreyDB SIFT `0.97` is marked `below_target` because
+  validation reached `0.968`; its measured test recall is `0.9738`.
+
 Isolated A/B and Pareto commands (write new files, leaving the published CSVs intact):
 ```bash
 # SIFT1M baseline (8/64) vs adaptive (16/128)
@@ -177,6 +197,8 @@ make bench-pareto-adaptive
 ## 3. Published Artifacts (`results/`)
 
 - `results/compare_engines.csv` — OspreyDB vs. Qdrant vs. `pgvector` across SIFT & Cohere 768d, using the adaptive auto candidate default (`candidates=0`).
+- `results/compare_engines_controlled.csv` — recall-matched controlled run (`0.95`/`0.97`) with isolated engines, unified peak-memory metric, concurrent latency, and no repeated test queries.
+- `results/compare_engines_controlled.md` — protocol, full result tables, analysis, and caveats for the controlled run.
 - `results/compare_engines_adaptive.csv` — isolated SIFT1M A/B for `refine_multiplier=1` (baseline, 8/64) vs `0` (adaptive, 16/128), plus Cohere 768d no-op rows.
 - `results/pareto_s3.csv` — 39-point `nprobe × refine_m` sweep against MinIO with `tc netem 15ms` (`WaRP` ON vs OFF).
 - `results/pareto_s3_adaptive.csv` — SIFT1M Pareto sweep for `refine_multiplier` 1 and 0, with requested/effective sizing per point.
