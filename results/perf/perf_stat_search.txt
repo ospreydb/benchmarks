@@ -1,7 +1,7 @@
-=== Profiling osprey search ===
+=== Profiling osprey-engine search ===
 [note] perf hardware PMU events blocked by kernel.perf_event_paranoid=4 (requires <=1 or CAP_PERFMON).
-[fallback] Collecting /usr/bin/time -v OS/CPU counters + osprey JSON telemetry:
-	Command being timed: "/home/ramos/orca/workspaces/osprey/phase-14/target/release/osprey search --index /home/ramos/orca/workspaces/osprey-benchmarks/artifacts/perf_profile/segment.osi --slabs /home/ramos/orca/workspaces/osprey-benchmarks/artifacts/perf_profile/segment.osv --query /home/ramos/orca/workspaces/osprey-benchmarks/artifacts/perf_profile/query_vec.json --nprobe 16 --candidates 200 --top-k 10 --json"
+[fallback] Collecting /usr/bin/time -v OS/CPU counters + osprey-engine JSON telemetry:
+	Command being timed: "/home/ramos/orca/workspaces/osprey/phase-14/target/release/osprey-engine search --index /home/ramos/orca/workspaces/osprey-benchmarks/artifacts/perf_profile/segment.osi --slabs /home/ramos/orca/workspaces/osprey-benchmarks/artifacts/perf_profile/segment.osv --query /home/ramos/orca/workspaces/osprey-benchmarks/artifacts/perf_profile/query_vec.json --nprobe 16 --candidates 200 --top-k 10 --json"
 	User time (seconds): 0.00
 	System time (seconds): 0.00
 	Percent of CPU this job got: 150%

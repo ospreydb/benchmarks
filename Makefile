@@ -1,8 +1,8 @@
 SHELL := /bin/bash
 PYTHON ?= $(CURDIR)/.venv/bin/python3
 PIP ?= $(CURDIR)/.venv/bin/pip
-OSPREY_SRC ?= $(abspath $(CURDIR)/../ospreydb)
-OSPREY_BIN ?= $(OSPREY_SRC)/target/release/osprey
+OSPREY_SRC ?= $(abspath $(CURDIR)/../osprey-engine)
+OSPREY_BIN ?= $(OSPREY_SRC)/target/release/osprey-engine
 RUNNER_BIN := $(CURDIR)/rust/target/release/osprey-bench-runner
 COMPOSE_FILE := $(CURDIR)/docker/docker-compose.yml
 
@@ -17,8 +17,8 @@ help:
 	@echo "OspreyDB Reproducible Benchmark Suite"
 	@echo "  make setup          Create Python .venv and install dependencies"
 	@echo "  make check          Python syntax, rustfmt, and compose config checks"
-	@echo "  make build-rust     Compile osprey CLI and osprey-bench-runner (--release, target-cpu=native)"
-	@echo "                      Override the core checkout with OSPREY_SRC=/path/to/ospreydb/ospreydb"
+	@echo "  make build-rust     Compile osprey-engine CLI and osprey-bench-runner (--release, target-cpu=native)"
+	@echo "                      Override the core checkout with OSPREY_SRC=/path/to/ospreydb/osprey-engine"
 	@echo "  make datasets       Download and prepare public datasets (SIFT1M, Cohere768d, SciFact, FiQA, MS MARCO)"
 	@echo "  make minio-up       Start MinIO (tc netem 15ms), Qdrant, and pgvector containers"
 	@echo "  make minio-down     Stop benchmark containers"
@@ -26,7 +26,7 @@ help:
 	@echo "  make bench-compare-controlled  Recall-matched controlled run (0.95/0.97, isolated engines)"
 	@echo "  make bench-compare-adaptive  SIFT1M A/B: refine_multiplier 1 (baseline) vs 0 (adaptive)"
 	@echo "  make bench-lutrank  Run LUT-Rank CPU vs ColBERTv2 benchmark"
-	@echo "  make bench-pareto   Run WaRP Pareto sweep over MinIO + tc netem"
+	@echo "  make bench-pareto   Run DP range coalescing Pareto sweep over MinIO + tc netem"
 	@echo "  make bench-pareto-adaptive  SIFT1M Pareto sweep for refine_multiplier 1 and 0"
 	@echo "  make profile-perf   Run perf stat / flamegraphs / ISA audit"
 	@echo "  make plots          Generate academic SVG figures in results/figures/"
@@ -43,14 +43,14 @@ check:
 
 build-rust:
 	@if [ -d "$(OSPREY_SRC)/crates/osprey-core" ]; then \
-		RUSTFLAGS="-C target-cpu=native" cargo build --manifest-path $(OSPREY_SRC)/Cargo.toml --release --bin osprey; \
+		RUSTFLAGS="-C target-cpu=native" cargo build --manifest-path $(OSPREY_SRC)/Cargo.toml --release --bin osprey-engine; \
 		RUSTFLAGS="-C target-cpu=native" cargo build --manifest-path $(CURDIR)/rust/Cargo.toml --release \
-			--config 'patch."https://github.com/ospreydb/ospreydb.git".osprey-core.path="$(OSPREY_SRC)/crates/osprey-core"' \
-			--config 'patch."https://github.com/ospreydb/ospreydb.git".osprey-simd.path="$(OSPREY_SRC)/crates/osprey-simd"' \
-			--config 'patch."https://github.com/ospreydb/ospreydb.git".osprey-storage.path="$(OSPREY_SRC)/crates/osprey-storage"'; \
+			--config 'patch."https://github.com/ospreydb/osprey-engine.git".osprey-core.path="$(OSPREY_SRC)/crates/osprey-core"' \
+			--config 'patch."https://github.com/ospreydb/osprey-engine.git".osprey-simd.path="$(OSPREY_SRC)/crates/osprey-simd"' \
+			--config 'patch."https://github.com/ospreydb/osprey-engine.git".osprey-storage.path="$(OSPREY_SRC)/crates/osprey-storage"'; \
 	else \
 		echo "error: $(OSPREY_SRC) does not contain crates/osprey-core" >&2; \
-		echo "       pass OSPREY_SRC=/path/to/ospreydb/ospreydb (commit 2e8e2f3 or newer)" >&2; \
+		echo "       pass OSPREY_SRC=/path/to/ospreydb/osprey-engine (commit 2e8e2f3 or newer)" >&2; \
 		exit 1; \
 	fi
 

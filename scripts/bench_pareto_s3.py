@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Tasks 172 & 178: MinIO + tc netem S3 Latency Simulation & WaRP Pareto Sweep.
+Tasks 172 & 178: MinIO + tc netem S3 Latency Simulation & DP Range Coalescing Pareto Sweep.
 
 Uploads `.osv` slabs to local MinIO (with `tc netem delay 15ms 3ms` active),
-verifies TTFB latency, and sweeps `(nprobe, refine_m)` with WaRP coalescing ON vs OFF
+verifies TTFB latency, and sweeps `(nprobe, refine_m)` with DP range coalescing ON vs OFF
 to produce `Recall@10 vs Latency (ms) vs S3 Range-GETs` Pareto frontiers.
 """
 
@@ -68,7 +68,7 @@ def run_search_eval(
     refine_list: str,
     refine_multiplier: int,
     max_queries: int,
-    no_warp: bool,
+    no_coalesce: bool,
     out_json: Path,
     env: Dict[str, str],
 ) -> None:
@@ -98,8 +98,8 @@ def run_search_eval(
         "--out-json",
         str(out_json),
     ]
-    if no_warp:
-        cmd.append("--no-warp")
+    if no_coalesce:
+        cmd.append("--no-coalesce")
     subprocess.run(cmd, env=env, check=True)
 
 
@@ -183,9 +183,9 @@ def main() -> int:
         else:
             refine_policy = f"forced-{refine_multiplier}"
 
-        warp_on_json = art_dir / f"pareto_warp_on_rm{refine_multiplier}.json"
+        coalesce_on_json = art_dir / f"pareto_coalesce_on_rm{refine_multiplier}.json"
         print(
-            f"=== WaRP ON sweep (refine_multiplier={refine_multiplier}, "
+            f"=== DP Coalescing ON sweep (refine_multiplier={refine_multiplier}, "
             f"policy={refine_policy}) ==="
         )
         run_search_eval(
@@ -198,14 +198,14 @@ def main() -> int:
             refine_multiplier,
             args.max_queries,
             False,
-            warp_on_json,
+            coalesce_on_json,
             env,
         )
 
-        # Also run WaRP OFF baseline on representative points to quantify exact S3 GET reduction
-        warp_off_json = art_dir / f"pareto_warp_off_rm{refine_multiplier}.json"
+        # Also run Coalesce OFF baseline on representative points to quantify exact S3 GET reduction
+        coalesce_off_json = art_dir / f"pareto_coalesce_off_rm{refine_multiplier}.json"
         print(
-            f"=== WaRP OFF sweep (refine_multiplier={refine_multiplier}, "
+            f"=== DP Coalescing OFF sweep (refine_multiplier={refine_multiplier}, "
             f"policy={refine_policy}) ==="
         )
         run_search_eval(
@@ -218,11 +218,14 @@ def main() -> int:
             refine_multiplier,
             args.max_queries,
             True,
-            warp_off_json,
+            coalesce_off_json,
             env,
         )
 
-        for p in json.loads(warp_on_json.read_text()) + json.loads(warp_off_json.read_text()):
+        for p in (
+            json.loads(coalesce_on_json.read_text())
+            + json.loads(coalesce_off_json.read_text())
+        ):
             p["dataset"] = args.dataset
             p["minio_netem_rtt_ms"] = round(measured_rtt_ms, 2)
             p["refine_policy"] = refine_policy

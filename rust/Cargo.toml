@@ -3,12 +3,12 @@ name = "osprey-bench-runner"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Reproducible benchmark runner for OspreyDB (S3Vec + WaRP + LUT-Rank)"
+description = "Reproducible benchmark runner for OspreyDB (1-bit RaBitQ + DP range coalescing + LUT-Rank)"
 
 [dependencies]
-osprey-core = { git = "https://github.com/ospreydb/ospreydb.git", branch = "main" }
-osprey-simd = { git = "https://github.com/ospreydb/ospreydb.git", branch = "main" }
-osprey-storage = { git = "https://github.com/ospreydb/ospreydb.git", branch = "main" }
+osprey-core = { git = "https://github.com/ospreydb/osprey-engine.git", branch = "main" }
+osprey-simd = { git = "https://github.com/ospreydb/osprey-engine.git", branch = "main" }
+osprey-storage = { git = "https://github.com/ospreydb/osprey-engine.git", branch = "main" }
 
 clap = { version = "4.5", features = ["derive"] }
 axum = "0.8"

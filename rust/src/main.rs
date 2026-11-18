@@ -23,7 +23,7 @@ use osprey_core::{
 };
 use osprey_simd::{SimdBackend, SimdEngine};
 use osprey_storage::{
-    build_object_store, MinipageLruCache, RefineStage, RemoteStoreConfig, WarpConfig,
+    build_object_store, MinipageLruCache, RangePlannerConfig, RefineStage, RemoteStoreConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -36,7 +36,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
-    /// Evaluates S3Vec (.osi + .osv over local or S3/MinIO) across (nprobe, refine_m) Pareto grid.
+    /// Evaluates OspreyDB vector search (.osi + .osv over local or S3/MinIO) across (nprobe, refine_m) Pareto grid.
     SearchEval {
         #[arg(long)]
         osi: PathBuf,
@@ -62,11 +62,11 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         cache_mb: usize,
         #[arg(long)]
-        no_warp: bool,
+        no_coalesce: bool,
         #[arg(long)]
         out_json: PathBuf,
     },
-    /// Serves the S3Vec index over local HTTP for controlled client-server benchmarks.
+    /// Serves the OspreyDB vector index over local HTTP for controlled client-server benchmarks.
     Serve {
         #[arg(long)]
         osi: PathBuf,
@@ -77,7 +77,7 @@ enum Cmd {
         #[arg(long, default_value_t = 16)]
         cache_mb: usize,
         #[arg(long)]
-        no_warp: bool,
+        no_coalesce: bool,
     },
     /// Evaluates CPU LUT-Rank (.osr) against MS MARCO / BEIR queries and qrels.
     LutrankEval {
@@ -124,7 +124,7 @@ struct SearchEvalPoint {
     low_dim_oversample: bool,
     auto_candidates: bool,
     orig_dim: u16,
-    warp_enabled: bool,
+    coalesce_enabled: bool,
     queries_evaluated: usize,
     recall_at_10: f64,
     p50_ms: f64,
@@ -133,11 +133,11 @@ struct SearchEvalPoint {
     mean_ms: f64,
     qps: f64,
     stage1_mean_ms: f64,
-    warp_plan_mean_us: f64,
+    range_plan_mean_us: f64,
     stage2_3_mean_ms: f64,
     avg_raw_pages: f64,
     avg_s3_gets: f64,
-    warp_coalesce_factor: f64,
+    coalesce_factor: f64,
     avg_bytes_fetched: f64,
     osi_bytes: u64,
     osv_bytes: u64,
@@ -506,7 +506,7 @@ fn run_server(
     slabs: &str,
     bind: &str,
     cache_mb: usize,
-    no_warp: bool,
+    no_coalesce: bool,
 ) -> Result<(), String> {
     let file = File::open(osi_path).map_err(|e| format!("open {}: {e}", osi_path.display()))?;
     let mmap = unsafe { Mmap::map(&file).map_err(|e| e.to_string())? };
@@ -526,20 +526,20 @@ fn run_server(
 
     let (directory, zstd_dict, _osv_bytes) = rt.block_on(load_osv_metadata(&store, &obj_path))?;
 
-    let warp_cfg = if no_warp {
-        WarpConfig {
+    let range_planner_cfg = if no_coalesce {
+        RangePlannerConfig {
             tau_req: 0.0,
             tau_byte: 1.0,
             max_coalesce_bytes: 0,
         }
     } else {
-        WarpConfig::default()
+        RangePlannerConfig::default()
     };
 
     let state = Arc::new(ServerState {
         osi: Arc::new(osi),
         orig_dim,
-        refine_stage: Arc::new(RefineStage::new(0, warp_cfg, zstd_dict)),
+        refine_stage: Arc::new(RefineStage::new(0, range_planner_cfg, zstd_dict)),
         directory,
         cache: Arc::new(MinipageLruCache::new(cache_mb.saturating_mul(1024 * 1024))),
         store,
@@ -575,7 +575,7 @@ fn run_search_eval(
     top_k: usize,
     max_queries: usize,
     cache_mb: usize,
-    no_warp: bool,
+    no_coalesce: bool,
     out_json: &Path,
 ) -> Result<(), String> {
     let osi_bytes = std::fs::metadata(osi_path)
@@ -603,16 +603,16 @@ fn run_search_eval(
 
     let (directory, zstd_dict, osv_bytes) = rt.block_on(load_osv_metadata(&store, &obj_path))?;
 
-    let warp_cfg = if no_warp {
-        WarpConfig {
+    let range_planner_cfg = if no_coalesce {
+        RangePlannerConfig {
             tau_req: 0.0,
             tau_byte: 1.0,
             max_coalesce_bytes: 0,
         }
     } else {
-        WarpConfig::default()
+        RangePlannerConfig::default()
     };
-    let refine_stage = RefineStage::new(0, warp_cfg, zstd_dict);
+    let refine_stage = RefineStage::new(0, range_planner_cfg, zstd_dict);
     let simd = SimdEngine::new_auto();
 
     let mut results = Vec::new();
@@ -652,7 +652,7 @@ fn run_search_eval(
 
             let mut latencies = Vec::with_capacity(q_count);
             let mut s1_sum = 0.0_f64;
-            let mut warp_us_sum = 0.0_f64;
+            let mut range_plan_us_sum = 0.0_f64;
             let mut s23_sum = 0.0_f64;
             let mut raw_pages_sum = 0_usize;
             let mut s3_gets_sum = 0_usize;
@@ -687,7 +687,7 @@ fn run_search_eval(
 
                 latencies.push(t0.elapsed().as_secs_f64() * 1000.0);
                 s1_sum += s1_ms;
-                warp_us_sum += stats.warp_plan_time_us as f64;
+                range_plan_us_sum += stats.range_plan_time_us as f64;
                 s23_sum += s23_ms;
                 raw_pages_sum += stats.raw_page_requests;
                 s3_gets_sum += stats.coalesced_range_gets;
@@ -730,7 +730,7 @@ fn run_search_eval(
                 low_dim_oversample: plan.low_dim_oversample,
                 auto_candidates: refine_m == 0,
                 orig_dim,
-                warp_enabled: !no_warp,
+                coalesce_enabled: !no_coalesce,
                 queries_evaluated: q_count,
                 recall_at_10: (recall_hits as f64) / (recall_denom.max(1) as f64),
                 p50_ms: percentile(&latencies, 50),
@@ -739,11 +739,11 @@ fn run_search_eval(
                 mean_ms,
                 qps: (q_count as f64) / total_wall_s.max(1e-9),
                 stage1_mean_ms: s1_sum / (q_count.max(1) as f64),
-                warp_plan_mean_us: warp_us_sum / (q_count.max(1) as f64),
+                range_plan_mean_us: range_plan_us_sum / (q_count.max(1) as f64),
                 stage2_3_mean_ms: s23_sum / (q_count.max(1) as f64),
                 avg_raw_pages: avg_raw,
                 avg_s3_gets: avg_gets,
-                warp_coalesce_factor: coalesce_factor,
+                coalesce_factor,
                 avg_bytes_fetched: (bytes_sum as f64) / (q_count.max(1) as f64),
                 osi_bytes,
                 osv_bytes,
@@ -1158,7 +1158,7 @@ fn main() -> Result<(), String> {
             top_k,
             max_queries,
             cache_mb,
-            no_warp,
+            no_coalesce,
             out_json,
         } => {
             let nprobes = parse_usize_list(&nprobe_list)?;
@@ -1174,7 +1174,7 @@ fn main() -> Result<(), String> {
                 top_k,
                 max_queries,
                 cache_mb,
-                no_warp,
+                no_coalesce,
                 &out_json,
             )
         }
@@ -1183,8 +1183,8 @@ fn main() -> Result<(), String> {
             slabs,
             bind,
             cache_mb,
-            no_warp,
-        } => run_server(&osi, &slabs, &bind, cache_mb, no_warp),
+            no_coalesce,
+        } => run_server(&osi, &slabs, &bind, cache_mb, no_coalesce),
         Cmd::LutrankEval {
             osr,
             queries_json,

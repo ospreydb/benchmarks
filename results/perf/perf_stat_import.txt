@@ -1,7 +1,7 @@
-=== Profiling osprey import ===
+=== Profiling osprey-engine import ===
 [note] perf hardware PMU events blocked by kernel.perf_event_paranoid=4 (requires <=1 or CAP_PERFMON).
-[fallback] Collecting /usr/bin/time -v OS/CPU counters + osprey JSON telemetry:
-	Command being timed: "/home/ramos/orca/workspaces/osprey/phase-14/target/release/osprey import --input /home/ramos/orca/workspaces/osprey-benchmarks/datasets/prepared/scifact/corpus_tokens.jsonl --output /home/ramos/orca/workspaces/osprey-benchmarks/artifacts/perf_profile --id-col doc_id --vec-col embedding --token-col tokens --with-lutrank --clusters 64 --json"
+[fallback] Collecting /usr/bin/time -v OS/CPU counters + osprey-engine JSON telemetry:
+	Command being timed: "/home/ramos/orca/workspaces/osprey/phase-14/target/release/osprey-engine import --input /home/ramos/orca/workspaces/osprey-benchmarks/datasets/prepared/scifact/corpus_tokens.jsonl --output /home/ramos/orca/workspaces/osprey-benchmarks/artifacts/perf_profile --id-col doc_id --vec-col embedding --token-col tokens --with-lutrank --clusters 64 --json"
 	User time (seconds): 1.75
 	System time (seconds): 0.25
 	Percent of CPU this job got: 125%

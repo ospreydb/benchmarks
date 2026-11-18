@@ -1598,6 +1598,7 @@ dependencies = [
 [[package]]
 name = "osprey-core"
 version = "0.1.0"
+source = "git+https://github.com/ospreydb/osprey-engine.git?branch=main#03e0b4e34d80a83a35edb351e3de383e69d848ac"
 dependencies = [
  "bytemuck",
  "half",
@@ -1611,6 +1612,7 @@ dependencies = [
 [[package]]
 name = "osprey-simd"
 version = "0.1.0"
+source = "git+https://github.com/ospreydb/osprey-engine.git?branch=main#03e0b4e34d80a83a35edb351e3de383e69d848ac"
 dependencies = [
  "osprey-core",
 ]
@@ -1618,6 +1620,7 @@ dependencies = [
 [[package]]
 name = "osprey-storage"
 version = "0.1.0"
+source = "git+https://github.com/ospreydb/osprey-engine.git?branch=main#03e0b4e34d80a83a35edb351e3de383e69d848ac"
 dependencies = [
  "arrow",
  "bytemuck",

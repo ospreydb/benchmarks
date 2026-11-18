@@ -2,7 +2,7 @@
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
 
-Reproducible benchmark suite for **[OspreyDB](https://github.com/ospreydb/ospreydb)**. Evaluates three subsystems against production baselines: recall-matched single-vector ANN search (`OspreyDB` 1-bit RaBitQ + `f16` rescore vs. `Qdrant` HNSW FP32, `Qdrant` 1-bit Binary Quantization, and `pgvector` HNSW FP32), late-interaction reranking (`LUT-Rank` AVX-512 CPU vs. ColBERTv2 on CPU and CUDA GPU), and object-storage vector search (`WaRP` Hilbert page coalescing over MinIO with `tc netem 15ms` latency).
+Reproducible benchmark suite for **[OspreyDB](https://github.com/ospreydb/osprey-engine)**. Evaluates three subsystems against production baselines: recall-matched single-vector ANN search (`OspreyDB` 1-bit RaBitQ + `f16` rescore vs. `Qdrant` HNSW FP32, `Qdrant` 1-bit Binary Quantization, and `pgvector` HNSW FP32), late-interaction reranking (`LUT-Rank` AVX-512 CPU vs. ColBERTv2 on CPU and CUDA GPU), and object-storage vector search (DP range coalescing with Hilbert page layout over MinIO with `tc netem 15ms` latency).
 
 ## Results
 
@@ -77,15 +77,15 @@ Reranking 200 candidate passages per query across 100 queries on MS MARCO, BEIR 
 
 ![LUT-Rank CPU vs ColBERTv2 CPU/GPU](results/figures/fig6_lutrank_cpu_vs_gpu.svg)
 
-### Object Storage Search: `WaRP` over MinIO (`tc netem 15ms`)
+### Object Storage Search: DP Range Coalescing over MinIO (`tc netem 15ms`)
 
 39-point `nprobe × refine_m` sweep on Cohere 768d stored in MinIO with kernel-injected `tc netem delay 15ms` (`17.0 ms` measured RTT). Raw data: [`results/pareto_s3.csv`](results/pareto_s3.csv).
 
-- At `Recall@10 = 0.960` (`nprobe=32, refine_m=200`), `WaRP` Hilbert-curve page layout + range coalescing merges `158.6` candidate `.osv` pages into **18.5 S3 Range-GETs** (**8.6× fewer requests** than uncoalesced fetching), reaching up to **15.2×–49.3×** fewer GETs at higher `refine_m / nprobe` ratios while keeping `VmHWM` under `103 MiB`.
+- At `Recall@10 = 0.960` (`nprobe=32, refine_m=200`), Hilbert-curve page layout + DP range coalescing merges `158.6` candidate `.osv` pages into **18.5 S3 Range-GETs** (**8.6× fewer requests** than uncoalesced fetching), reaching up to **15.2×–49.3×** fewer GETs at higher `refine_m / nprobe` ratios while keeping `VmHWM` under `103 MiB`.
 
-![WaRP S3 Range-GET Coalescing](results/figures/fig5_warp_s3_requests_16x.svg)
+![DP Range Coalescing S3 Range-GET Reduction](results/figures/fig5_coalesced_s3_requests_16x.svg)
 
-![WaRP Pareto Frontier: Recall@10 vs S3 Latency](results/figures/fig7_pareto_recall_latency_s3.svg)
+![DP Range Coalescing Pareto Frontier: Recall@10 vs S3 Latency](results/figures/fig7_pareto_recall_latency_s3.svg)
 
 ## Protocol & Caveats
 
@@ -100,24 +100,24 @@ Full methodology and per-dataset breakdown: [`results/compare_engines_controlled
 
 ## Reproduction
 
-Requires Linux (`x86_64` with AVX-512 recommended), Python 3.10+, Rust toolchain, Docker Compose v2, and a sibling checkout of [`ospreydb/ospreydb`](https://github.com/ospreydb/ospreydb) at `../ospreydb`.
+Requires Linux (`x86_64` with AVX-512 recommended), Python 3.10+, Rust toolchain, Docker Compose v2, and a sibling checkout of [`ospreydb/osprey-engine`](https://github.com/ospreydb/osprey-engine) at `../osprey-engine`.
 
 ```bash
 # 1. Create .venv and install Python dependencies
 make setup
 
-# 2. Build native osprey CLI and osprey-bench-runner (-C target-cpu=native)
-make build-rust OSPREY_SRC=../ospreydb
+# 2. Build native osprey-engine CLI and osprey-bench-runner (-C target-cpu=native)
+make build-rust OSPREY_SRC=../osprey-engine
 
 # 3. Validate Python scripts, Rust formatting, and Docker Compose config
 make check
 
 # 4. Run the recall-matched controlled benchmark (OspreyDB, Qdrant FP32/BQ, pgvector)
-make bench-compare-controlled OSPREY_SRC=../ospreydb
+make bench-compare-controlled OSPREY_SRC=../osprey-engine
 
 # 5. Or run the full pipeline (datasets -> MinIO/Docker -> controlled + legacy ANN ->
-#    LUT-Rank -> WaRP S3 Pareto -> perf/ISA audit -> SVG plots)
-make bench-all OSPREY_SRC=../ospreydb
+#    LUT-Rank -> DP Coalescing S3 Pareto -> perf/ISA audit -> SVG plots)
+make bench-all OSPREY_SRC=../osprey-engine
 ```
 
 Individual targets (`make datasets`, `make minio-up`, `make bench-lutrank`, `make bench-pareto`, `make profile-perf`, `make plots`) are documented in [`Makefile`](Makefile).
@@ -128,14 +128,14 @@ Individual targets (`make datasets`, `make minio-up`, `make bench-lutrank`, `mak
 
 - When `candidates = 0` (the default when `--refine-m` is omitted), `SearchOptions::resolve` selects `2000` candidates for `orig_dim <= 256` and `300` for `orig_dim > 256`.
 - When `refine_multiplier = 0` (adaptive default), `orig_dim <= 256` doubles `nprobe` and `candidates` (`nprobe=16, refine_m=1500` → effective `32/3000` on 128d SIFT1M, bounded by the `top_m <= 4096` Stage-1 heap limit) and enforces a 128-vector exact-`f16` rescore floor. For `orig_dim > 256` (e.g., Cohere 768d), `effective == requested`.
-- Pass `--refine-multiplier 1` to disable adaptive doubling or run `make bench-compare-adaptive OSPREY_SRC=../ospreydb` / `make bench-pareto-adaptive OSPREY_SRC=../ospreydb` to reproduce the isolated A/B sweeps in `results/compare_engines_adaptive.csv` and `results/pareto_s3_adaptive.csv`.
+- Pass `--refine-multiplier 1` to disable adaptive doubling or run `make bench-compare-adaptive OSPREY_SRC=../osprey-engine` / `make bench-pareto-adaptive OSPREY_SRC=../osprey-engine` to reproduce the isolated A/B sweeps in `results/compare_engines_adaptive.csv` and `results/pareto_s3_adaptive.csv`.
 
 ## Published Artifacts (`results/`)
 
 - [`results/compare_engines_controlled.csv`](results/compare_engines_controlled.csv) & [`results/compare_engines_controlled.md`](results/compare_engines_controlled.md) — Recall-matched (`0.95` / `0.97`) evaluation of OspreyDB, Qdrant FP32, Qdrant 1-bit BQ, and `pgvector` FP32.
 - [`results/compare_engines.csv`](results/compare_engines.csv) & [`results/compare_engines_adaptive.csv`](results/compare_engines_adaptive.csv) — Uncalibrated default comparison and isolated `refine_multiplier` A/B sweep on SIFT1M.
 - [`results/lutrank_vs_colbert.csv`](results/lutrank_vs_colbert.csv) — `LUT-Rank` AVX-512 CPU vs. ColBERTv2 (PyTorch CPU/CUDA, ONNX Runtime, NumPy BLAS) on MS MARCO, SciFact, and FiQA.
-- [`results/pareto_s3.csv`](results/pareto_s3.csv) & [`results/pareto_s3_adaptive.csv`](results/pareto_s3_adaptive.csv) — `WaRP` ON vs. OFF Pareto sweeps over MinIO with `tc netem 15ms`.
+- [`results/pareto_s3.csv`](results/pareto_s3.csv) & [`results/pareto_s3_adaptive.csv`](results/pareto_s3_adaptive.csv) — DP range coalescing ON vs. OFF Pareto sweeps over MinIO with `tc netem 15ms`.
 - [`results/sift1m_adaptive_recall_recovery.json`](results/sift1m_adaptive_recall_recovery.json) — Stage-1 adaptive oversampling recall recovery telemetry on SIFT1M.
 - [`results/perf/`](results/perf/) — `perf stat` / `rusage` logs, `objdump` AVX-512 instruction counts (`prefetcht0`, `vpopcntq`, `vpshufb`, `vpternlogq`), and JSON stage breakdowns.
 - [`results/figures/`](results/figures/) — Vector SVG plots (`fig1`–`fig7`) generated by [`scripts/generate_plots.py`](scripts/generate_plots.py).

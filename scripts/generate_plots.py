@@ -7,7 +7,7 @@ Generates:
   2. fig2_recall_latency_controlled.svg     : Test Recall@10 vs client P50 latency
   3. fig3_build_time_controlled.svg         : Index build time per engine
   4. fig4_validation_test_recall_controlled.svg : Validation vs test recall at each target
-  5. fig5_warp_s3_requests_16x.svg          : S3 Range-GET reduction with WaRP DP + TSP vs uncoalesced GETs
+  5. fig5_coalesced_s3_requests_16x.svg     : S3 Range-GET reduction with DP range coalescing vs uncoalesced GETs
   6. fig6_lutrank_cpu_vs_gpu.svg            : LUT-Rank CPU (~3.8 ms) vs ColBERTv2 CPU & GPU latency & NDCG@10
   7. fig7_pareto_recall_latency_s3.svg      : Pareto curve Recall@10 vs Latency (ms) vs S3 Requests
 """
@@ -394,20 +394,20 @@ def plot_fig4_controlled_recall_targets() -> None:
     print(f"[plot] {out}")
 
 
-def plot_fig5_warp_s3() -> None:
+def plot_fig5_coalesced_s3() -> None:
     rows = read_csv_rows(RESULTS_DIR / "pareto_s3.csv")
     if not rows:
         return
 
-    warp_on = [r for r in rows if r["warp_enabled"].lower() == "true"]
-    warp_off = [r for r in rows if r["warp_enabled"].lower() == "false"]
-    if not warp_on or not warp_off:
+    coalesce_on = [r for r in rows if r["coalesce_enabled"].lower() == "true"]
+    coalesce_off = [r for r in rows if r["coalesce_enabled"].lower() == "false"]
+    if not coalesce_on or not coalesce_off:
         return
 
     # Match (nprobe, refine_m) pairs present in both ON and OFF
-    off_map = {(int(r["nprobe"]), int(r["refine_m"])): r for r in warp_off}
+    off_map = {(int(r["nprobe"]), int(r["refine_m"])): r for r in coalesce_off}
     pairs = []
-    for r in warp_on:
+    for r in coalesce_on:
         key = (int(r["nprobe"]), int(r["refine_m"]))
         if key in off_map:
             pairs.append((key, r, off_map[key]))
@@ -423,8 +423,8 @@ def plot_fig5_warp_s3() -> None:
     x = np.arange(len(labels))
     w = 0.36
 
-    ax1.bar(x - w / 2, gets_off, width=w, label="Uncoalesced S3 GETs (WaRP OFF)", color="#94A3B8", edgecolor="#0F172A", lw=0.6)
-    ax1.bar(x + w / 2, gets_on, width=w, label="Coalesced S3 get_ranges (WaRP DP + TSP)", color="#0F766E", edgecolor="#0F172A", lw=0.6)
+    ax1.bar(x - w / 2, gets_off, width=w, label="Uncoalesced S3 GETs (Coalesce OFF)", color="#94A3B8", edgecolor="#0F172A", lw=0.6)
+    ax1.bar(x + w / 2, gets_on, width=w, label="Coalesced S3 get_ranges (DP Coalescing)", color="#0F766E", edgecolor="#0F172A", lw=0.6)
     ax1.set_xticks(x)
     ax1.set_xticklabels(labels, fontsize=8)
     ax1.set_ylabel("Mean S3 Range-GETs / Query")
@@ -435,8 +435,8 @@ def plot_fig5_warp_s3() -> None:
         factor = off_v / max(on_v, 1e-6)
         ax1.text(x[i] + w / 2, on_v + max(gets_off) * 0.02, f"{factor:.1f}x", ha="center", va="bottom", fontsize=8, color="#0F766E", fontweight="bold")
 
-    ax2.bar(x - w / 2, lat_off, width=w, label="WaRP OFF (MinIO tc netem 15ms)", color="#CBD5E1", edgecolor="#0F172A", lw=0.6)
-    ax2.bar(x + w / 2, lat_on, width=w, label="WaRP DP + TSP (MinIO tc netem 15ms)", color="#2563EB", edgecolor="#0F172A", lw=0.6)
+    ax2.bar(x - w / 2, lat_off, width=w, label="Coalesce OFF (MinIO tc netem 15ms)", color="#CBD5E1", edgecolor="#0F172A", lw=0.6)
+    ax2.bar(x + w / 2, lat_on, width=w, label="DP Coalescing (MinIO tc netem 15ms)", color="#2563EB", edgecolor="#0F172A", lw=0.6)
     ax2.set_xticks(x)
     ax2.set_xticklabels(labels, fontsize=8)
     ax2.set_ylabel("P50 End-to-End S3 Latency (ms)")
@@ -444,7 +444,7 @@ def plot_fig5_warp_s3() -> None:
     ax2.legend(frameon=True, fontsize=8.5)
 
     fig.tight_layout()
-    out = FIG_DIR / "fig5_warp_s3_requests_16x.svg"
+    out = FIG_DIR / "fig5_coalesced_s3_requests_16x.svg"
     fig.savefig(out, format="svg")
     plt.close(fig)
     print(f"[plot] {out}")
@@ -504,18 +504,18 @@ def plot_fig6_lutrank() -> None:
 
 def plot_fig7_pareto() -> None:
     rows = read_csv_rows(RESULTS_DIR / "pareto_s3.csv")
-    warp_on = [r for r in rows if r["warp_enabled"].lower() == "true"]
-    if not warp_on:
+    coalesce_on = [r for r in rows if r["coalesce_enabled"].lower() == "true"]
+    if not coalesce_on:
         return
 
     fig, ax = plt.subplots(figsize=(8.0, 5.2))
-    nprobes = sorted(set(int(r["nprobe"]) for r in warp_on))
+    nprobes = sorted(set(int(r["nprobe"]) for r in coalesce_on))
     cmap = plt.get_cmap("viridis")
 
     all_pts = []
     for i, np_val in enumerate(nprobes):
         pts = sorted(
-            [r for r in warp_on if int(r["nprobe"]) == np_val],
+            [r for r in coalesce_on if int(r["nprobe"]) == np_val],
             key=lambda r: int(r["refine_m"]),
         )
         lats = [float(r["p50_ms"]) for r in pts]
@@ -599,7 +599,7 @@ def plot_fig7_pareto() -> None:
     ax.set_ylim(69.5, 99.8)
     ax.set_xlabel("P50 Query Latency Over MinIO tc netem (ms)")
     ax.set_ylabel("Recall@10 (%)")
-    ax.set_title("Pareto Frontier: Recall@10 vs Latency vs S3 GETs (Cohere 768d, WaRP ON)")
+    ax.set_title("Pareto Frontier: Recall@10 vs Latency vs S3 GETs (Cohere 768d, Coalesce ON)")
     ax.legend(frameon=True, fontsize=8.5, loc="lower right", ncol=2)
 
     fig.tight_layout()
@@ -619,7 +619,7 @@ def main() -> int:
     plot_fig2_controlled_recall_latency()
     plot_fig3_controlled_build_time()
     plot_fig4_controlled_recall_targets()
-    plot_fig5_warp_s3()
+    plot_fig5_coalesced_s3()
     plot_fig6_lutrank()
     plot_fig7_pareto()
     return 0

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Tasks 175 & 176: Hardware Counters (perf stat) & CPU Flamegraphs (cargo flamegraph)
-# for `osprey import`, `osprey search`, and `osprey rerank`, plus assembly prefetch/SIMD audit.
+# for `osprey-engine import`, `osprey-engine search`, and `osprey-engine rerank`, plus assembly prefetch/SIMD audit.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OSPREY_BIN="${OSPREY_BIN:-/home/ramos/orca/workspaces/osprey/phase-14/target/release/osprey}"
-OSPREY_SRC="${OSPREY_SRC:-/home/ramos/orca/workspaces/osprey/phase-14}"
+OSPREY_SRC="${OSPREY_SRC:-$ROOT/../osprey-engine}"
+OSPREY_BIN="${OSPREY_BIN:-$OSPREY_SRC/target/release/osprey-engine}"
 PERF_DIR="$ROOT/results/perf"
 DATASET_DIR="${DATASET_DIR:-$ROOT/datasets/prepared/scifact}"
 ART_DIR="$ROOT/artifacts/perf_profile"
@@ -25,7 +25,7 @@ echo "[audit] Disassembly SIMD & prefetch instruction counts for $OSPREY_BIN:" |
   echo "vpternlogq_count=$(objdump -d "$OSPREY_BIN" | grep -c 'vpternlogq' || true)"
 } | tee -a "$PERF_DIR/isa_audit.txt"
 
-# Prepare query JSON + query tokens + candidate IDs for `osprey search` and `osprey rerank`
+# Prepare query JSON + query tokens + candidate IDs for `osprey-engine search` and `osprey-engine rerank`
 python3 - "$DATASET_DIR" "$ART_DIR" <<'PY'
 import json, sys
 from pathlib import Path
@@ -41,13 +41,13 @@ run_perf_or_rusage() {
   local name="$1"
   shift
   local log_file="$PERF_DIR/perf_stat_${name}.txt"
-  echo "=== Profiling osprey $name ===" | tee "$log_file"
+  echo "=== Profiling osprey-engine $name ===" | tee "$log_file"
   if [ "$PARANOID" -le 1 ] 2>/dev/null && command -v perf >/dev/null 2>&1; then
     perf stat -e cycles,instructions,L1-dcache-loads,L1-dcache-load-misses,LLC-loads,LLC-load-misses,branch-instructions,branch-misses,task-clock \
       -o "$log_file" --append -- "$@" >/dev/null
   else
     echo "[note] perf hardware PMU events blocked by kernel.perf_event_paranoid=$PARANOID (requires <=1 or CAP_PERFMON)." | tee -a "$log_file"
-    echo "[fallback] Collecting /usr/bin/time -v OS/CPU counters + osprey JSON telemetry:" | tee -a "$log_file"
+    echo "[fallback] Collecting /usr/bin/time -v OS/CPU counters + osprey-engine JSON telemetry:" | tee -a "$log_file"
     if [ -x /usr/bin/time ]; then
       /usr/bin/time -v "$@" > "$PERF_DIR/stdout_${name}.json" 2>> "$log_file"
     else
@@ -56,7 +56,7 @@ run_perf_or_rusage() {
   fi
 }
 
-# 2. Profile `osprey import`
+# 2. Profile `osprey-engine import`
 run_perf_or_rusage "import" \
   "$OSPREY_BIN" import \
     --input "$DATASET_DIR/corpus_tokens.jsonl" \
@@ -68,7 +68,7 @@ run_perf_or_rusage "import" \
     --clusters 64 \
     --json
 
-# 3. Profile `osprey search`
+# 3. Profile `osprey-engine search`
 run_perf_or_rusage "search" \
   "$OSPREY_BIN" search \
     --index "$ART_DIR/segment.osi" \
@@ -79,7 +79,7 @@ run_perf_or_rusage "search" \
     --top-k 10 \
     --json
 
-# 4. Profile `osprey rerank`
+# 4. Profile `osprey-engine rerank`
 run_perf_or_rusage "rerank" \
   "$OSPREY_BIN" rerank \
     --rerank-store "$ART_DIR/segment.osr" \
@@ -88,7 +88,7 @@ run_perf_or_rusage "rerank" \
     --top-k 10 \
     --json
 
-# 5. Profile `osprey bench --with-lutrank` (20k vectors for sustained hot-loop sampling)
+# 5. Profile `osprey-engine bench --with-lutrank` (20k vectors for sustained hot-loop sampling)
 run_perf_or_rusage "bench_lutrank" \
   "$OSPREY_BIN" bench \
     --vectors 20000 \
@@ -105,11 +105,11 @@ if [ "$PARANOID" -le 1 ] 2>/dev/null && cargo flamegraph --help >/dev/null 2>&1;
   echo "[flamegraph] Generating CPU flamegraphs via cargo flamegraph..." | tee "$FLAME_LOG"
   (
     cd "$OSPREY_SRC"
-    cargo flamegraph --release --bin osprey -o "$PERF_DIR/flamegraph_import.svg" -- \
+    cargo flamegraph --release --bin osprey-engine -o "$PERF_DIR/flamegraph_import.svg" -- \
       import --input "$DATASET_DIR/corpus_tokens.jsonl" --output "$ART_DIR" --id-col doc_id --vec-col embedding --token-col tokens --with-lutrank --clusters 64
-    cargo flamegraph --release --bin osprey -o "$PERF_DIR/flamegraph_search.svg" -- \
+    cargo flamegraph --release --bin osprey-engine -o "$PERF_DIR/flamegraph_search.svg" -- \
       search --index "$ART_DIR/segment.osi" --slabs "$ART_DIR/segment.osv" --query "$ART_DIR/query_vec.json" --nprobe 16 --candidates 200 --top-k 10
-    cargo flamegraph --release --bin osprey -o "$PERF_DIR/flamegraph_rerank.svg" -- \
+    cargo flamegraph --release --bin osprey-engine -o "$PERF_DIR/flamegraph_rerank.svg" -- \
       rerank --rerank-store "$ART_DIR/segment.osr" --query-tokens "$ART_DIR/query_tokens.json" --candidates-file "$ART_DIR/candidates.txt" --top-k 10
   )
 else
