@@ -1,224 +1,145 @@
-# OspreyDB Reproducible Benchmarks (`ospreydb/benchmarks`)
+# OspreyDB Benchmarks
 
-Official scientific benchmark suite, MinIO `tc netem` S3 latency simulator, hardware profiling scripts, and publication SVG artifact generator for **[OspreyDB](https://github.com/ospreydb/ospreydb)**.
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
 
-## 1. Benchmark Scope (Phase 14)
+Reproducible benchmark suite for **[OspreyDB](https://github.com/ospreydb/ospreydb)**. Evaluates three subsystems against production baselines: recall-matched single-vector ANN search (`OspreyDB` 1-bit RaBitQ + `f16` rescore vs. `Qdrant` HNSW FP32, `Qdrant` 1-bit Binary Quantization, and `pgvector` HNSW FP32), late-interaction reranking (`LUT-Rank` AVX-512 CPU vs. ColBERTv2 on CPU and CUDA GPU), and object-storage vector search (`WaRP` Hilbert page coalescing over MinIO with `tc netem 15ms` latency).
 
-| Task | Scope | Script / Manifest |
-| :--- | :--- | :--- |
-| **171** | Public dataset download & preparation (MS MARCO Passages, BEIR SciFact/FiQA, SIFT1M, GIST1M, Cohere Wikipedia 768d) | `scripts/download_datasets.py` |
-| **172** | Local S3 simulation with MinIO + `tc netem delay 15ms` | `docker/docker-compose.yml`, `docker/Dockerfile.netem` |
-| **173** | OspreyDB vs. Qdrant (HNSW) vs. `pgvector` (HNSW) — build time, peak RSS (`VmHWM`), disk size, `Recall@10`, QPS | `scripts/bench_compare_engines.py` |
-| **174** | `LUT-Rank` CPU (AVX-512 `vpshufb`) vs. ColBERTv2 (PyTorch CPU/GPU & NumPy BLAS) — latency, QPS, `NDCG@10`, `MRR@10` | `scripts/bench_lutrank_vs_colbert.py` |
-| **175–176** | Hardware counter audit (`perf stat`), OS `rusage`, ISA disassembly audit (`prefetcht0`, `vpopcntq`, `vpshufb`), and Flamegraphs | `scripts/profile_perf.sh` |
-| **177** | Software prefetching (`_mm_prefetch` `_MM_HINT_T0`) in `.osi` scanner & `.osr` lattice evaluator | Implemented in `ospreydb/ospreydb` (`osprey-core`, `osprey-simd`, `osprey-storage`) |
-| **178** | Pareto frontier (`nprobe × refine_m`) for `Recall@10 vs Latency (ms) vs S3 Range-GETs` (`WaRP` ON vs OFF) | `scripts/bench_pareto_s3.py`, `rust/src/main.rs` |
-| **179** | Academic publication vector SVG figures | `scripts/generate_plots.py` -> `results/figures/` |
-| **180** | Single-command full reproduction & raw artifact publishing | `make bench-all` |
+## Results
 
-## 2. Quickstart
+### SIFT1M (1M × 128d)
+
+Recall-matched evaluation (`Recall@10` targets `0.95` and `0.97`, 925 unique test queries, 16 concurrent workers for QPS, OspreyDB bounded to a 256 MiB page cache). Raw data: [`results/compare_engines_controlled.csv`](results/compare_engines_controlled.csv).
+
+| Engine | Target | R@10 | P50 (ms) | P95 (ms) | QPS (16w) | RAM (MiB) | Disk (MiB) | Build (s) |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **OspreyDB** | 0.95 | 0.9641 | 2.98 | 3.41 | 783 | **462** | **213** | **17.5** |
+| **OspreyDB** | 0.97 | 0.9738¹ | 3.43 | 3.91 | 784 | **462** | **213** | **17.5** |
+| Qdrant FP32 | 0.95 | 0.9672 | 0.85 | 0.94 | 834 | 4,195 | 868 | 34.9 |
+| Qdrant FP32 | 0.97 | 0.9905 | 0.89 | 0.98 | 828 | 4,195 | 868 | 34.9 |
+| Qdrant 1-bit BQ | 0.95 | 0.0624 (miss) | 0.73 | 0.85 | 790 | 4,781 | 911 | 28.3 |
+| Qdrant 1-bit BQ | 0.97 | 0.0624 (miss) | 0.75 | 0.87 | 849 | 4,781 | 911 | 28.3 |
+| pgvector FP32 | 0.95 | 0.9726 | 2.37 | 2.89 | 1,793 | 2,594 | 2,144 | 306.5 |
+| pgvector FP32 | 0.97 | 0.9863 | 3.26 | 3.95 | 1,349 | 2,594 | 2,144 | 306.5 |
+
+¹ Marked `below_target` on the 375-query validation split (`0.9680`); meets the `0.97` target on the 925-query test split (`0.9738`).
+
+- **Latency vs. footprint:** Qdrant FP32 achieves the lowest sequential P50 (`0.85–0.89 ms` vs. OspreyDB `2.98–3.43 ms`) by keeping the unquantized HNSW graph in RAM (`4,195 MiB`). OspreyDB uses **9.1× less peak RAM** (`462 MiB`), **4.1× less disk** (`213 MiB`), and builds **2.0× faster** (`17.5 s` vs. `34.9 s`, and `17.5×` faster than `pgvector`).
+- **1-bit quantization at 128d:** Qdrant 1-bit BQ (`always_ram=true, rescore=true, ef=256, oversampling=3.0`) collapses to `R@10 = 0.0624` on 128d SIFT vectors. OspreyDB's 1-bit RaBitQ Stage-1 + `f16` Stage-2 rescore reaches `0.9738`.
+
+### Cohere (100k × 768d)
+
+550 unique test queries (250 calibration, 200 warmup, 550 test). Raw data: [`results/compare_engines_controlled.csv`](results/compare_engines_controlled.csv).
+
+| Engine | Target | R@10 | P50 (ms) | P95 (ms) | QPS (16w) | RAM (MiB) | Disk (MiB) | Build (s) |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **OspreyDB** | 0.95 | 0.9669 | 0.80 | 0.96 | 908 | **235** | **152** | 19.6 |
+| **OspreyDB** | 0.97 | **0.9889** | 0.97 | 1.18 | 913 | **235** | **152** | 19.6 |
+| Qdrant FP32 | 0.95 | 0.9647 | 0.70 | 0.78 | 860 | 2,731 | 1,368² | 16.8 |
+| Qdrant FP32 | 0.97 | 0.9855 | 0.86 | 0.97 | 820 | 2,731 | 1,368² | 16.8 |
+| Qdrant 1-bit BQ | 0.95 | 0.9342 (miss) | 0.68 | 0.74 | 863 | 2,799 | 661² | 14.9 |
+| Qdrant 1-bit BQ | 0.97 | 0.9342 (miss) | 0.70 | 0.79 | 846 | 2,799 | 661² | 14.9 |
+| pgvector FP32 | 0.95 | 0.9771 | 1.79 | 2.22 | 2,290 | 1,332 | 1,184 | 64.0 |
+| pgvector FP32 | 0.97 | 0.9771 | 1.78 | 2.23 | 2,282 | 1,332 | 1,184 | 64.0 |
+
+² Sampled before background compaction finished (`804 MiB` for FP32 and `355 MiB` for BQ after shutdown; OspreyDB remains **5.3×** and **2.3×** smaller).
+
+- At 768 dimensions, OspreyDB matches sub-millisecond P50 latency (`0.80–0.97 ms` vs. Qdrant FP32 `0.70–0.86 ms` and `pgvector` `1.78–1.79 ms`) while using **11.6× less RAM** than Qdrant (`235 MiB` vs. `2,731 MiB`) and **5.7× less RAM** than `pgvector` (`1,332 MiB`).
+
+![Controlled Peak Memory and Disk Footprint](results/figures/fig1_memory_disk_controlled.svg)
+
+![Controlled Recall@10 vs Client P50 Latency](results/figures/fig2_recall_latency_controlled.svg)
+
+Additional controlled plots: [Index Build Time (`fig3`)](results/figures/fig3_build_time_controlled.svg) · [Validation vs. Test Recall (`fig4`)](results/figures/fig4_validation_test_recall_controlled.svg).
+
+### Late-Interaction Reranking: `LUT-Rank` vs. ColBERTv2
+
+Reranking 200 candidate passages per query across 100 queries on MS MARCO, BEIR SciFact, and BEIR FiQA. `†` denotes the fastest CPU engine. Raw data: [`results/lutrank_vs_colbert.csv`](results/lutrank_vs_colbert.csv).
+
+| Dataset | Engine | Device | P50 (ms) | P99 (ms) | QPS | NDCG@10 | MRR@10 | Index (MiB) |
+| :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **MS MARCO** | **OspreyDB LUT-Rank** | **AVX-512 CPU** | **0.329†** | 0.552 | **2,849†** | 0.7768 | 0.7389 | **97.2** |
+| MS MARCO | ColBERTv2 (PyTorch) | CPU | 0.416 | **0.534†** | 2,301 | 0.7876 | 0.7530 | 768.4 |
+| MS MARCO | ColBERTv2 (ONNX Runtime) | CPU | 0.476 | 0.733 | 2,005 | 0.7876 | 0.7530 | 768.4 |
+| MS MARCO | ColBERTv2 Exact (NumPy) | BLAS CPU | 0.801 | 0.899 | 1,217 | 0.7876 | 0.7530 | 768.4 |
+| MS MARCO | ColBERTv2 (PyTorch) | CUDA GPU | 0.226 | 0.308 | 4,134 | 0.7876 | 0.7530 | 768.4 |
+| **SciFact** | **OspreyDB LUT-Rank** | **AVX-512 CPU** | 0.505 | **0.551†** | 2,122 | 0.5854 | 0.5437 | **10.2** |
+| SciFact | ColBERTv2 (PyTorch) | CPU | 0.345 | 1.584 | **2,398†** | 0.5999 | 0.5629 | 81.0 |
+| SciFact | ColBERTv2 (ONNX Runtime) | CPU | **0.338†** | 4.574 | 1,365 | 0.5999 | 0.5629 | 81.0 |
+| SciFact | ColBERTv2 Exact (NumPy) | BLAS CPU | 0.679 | 0.849 | 1,453 | 0.5999 | 0.5629 | 81.0 |
+| SciFact | ColBERTv2 (PyTorch) | CUDA GPU | 0.207 | 0.703 | 2,581 | 0.6006 | 0.5638 | 81.0 |
+| **FiQA** | **OspreyDB LUT-Rank** | **AVX-512 CPU** | 0.519 | 0.722 | 2,006 | 0.4257 | 0.4965 | **112.8** |
+| FiQA | ColBERTv2 (PyTorch) | CPU | **0.428†** | **0.532†** | **2,220†** | 0.4372 | 0.5122 | 892.0 |
+| FiQA | ColBERTv2 (ONNX Runtime) | CPU | 0.469 | 4.090 | 1,050 | 0.4372 | 0.5122 | 892.0 |
+| FiQA | ColBERTv2 Exact (NumPy) | BLAS CPU | 0.864 | 0.955 | 1,143 | 0.4372 | 0.5122 | 892.0 |
+| FiQA | ColBERTv2 (PyTorch) | CUDA GPU | 0.229 | 0.338 | 4,126 | 0.4389 | 0.5137 | 892.0 |
+
+- `LUT-Rank` (`vpshufb` 4-bit lookup tables synthesized in `6.7–10.8 µs/query`) compresses `.osr` token lattices **7.9×** versus ColBERTv2 across all three datasets (`97.2 MiB` vs. `768.4 MiB` on MS MARCO) while retaining `98.6%` of exact `NDCG@10` and leading CPU throughput (`2,849 QPS`, `0.329 ms` P50) on MS MARCO.
+
+![LUT-Rank CPU vs ColBERTv2 CPU/GPU](results/figures/fig6_lutrank_cpu_vs_gpu.svg)
+
+### Object Storage Search: `WaRP` over MinIO (`tc netem 15ms`)
+
+39-point `nprobe × refine_m` sweep on Cohere 768d stored in MinIO with kernel-injected `tc netem delay 15ms` (`17.0 ms` measured RTT). Raw data: [`results/pareto_s3.csv`](results/pareto_s3.csv).
+
+- At `Recall@10 = 0.960` (`nprobe=32, refine_m=200`), `WaRP` Hilbert-curve page layout + range coalescing merges `158.6` candidate `.osv` pages into **18.5 S3 Range-GETs** (**8.6× fewer requests** than uncoalesced fetching), reaching up to **15.2×–49.3×** fewer GETs at higher `refine_m / nprobe` ratios while keeping `VmHWM` under `103 MiB`.
+
+![WaRP S3 Range-GET Coalescing](results/figures/fig5_warp_s3_requests_16x.svg)
+
+![WaRP Pareto Frontier: Recall@10 vs S3 Latency](results/figures/fig7_pareto_recall_latency_s3.svg)
+
+## Protocol & Caveats
+
+Full methodology and per-dataset breakdown: [`results/compare_engines_controlled.md`](results/compare_engines_controlled.md).
+
+- **Asymmetric cache budget:** OspreyDB runs with an explicit 256 MiB page-cache cap (`--controlled-cache-mb 256`), whereas Qdrant and `pgvector` containers are allowed to hold their entire indexes in the host page cache. This favors the competitors on P50 latency and isolates OspreyDB's bounded-RAM execution path.
+- **Peak memory accounting (`VmHWM` vs. `cgroup v2 memory.peak`):** Native OspreyDB is measured via `/proc/<pid>/status` `VmHWM`. Dockerized Qdrant and `pgvector` are measured via container `cgroup v2 memory.peak`, which captures page-cache-resident index blocks (preventing the false `148 MiB` process-only RSS reading in `pgvector`).
+- **Disjoint splits and zero query repetition:** Calibration uses 25% of the query set (375 queries on SIFT1M, 250 on Cohere) with strict `Recall@10 >= target` filtering. Latency and recall are measured over 200 warmup queries followed by all remaining unique test queries (925 on SIFT1M, 550 on Cohere) across 3 rounds, with no repeated queries.
+- **Cohere 100k scale:** The Cohere Wikipedia 768d benchmark uses the 100,000-vector subset (1,000 total queries), not 1M vectors.
+- **Qdrant post-compaction disk size:** The `1,368 MiB` (FP32) and `661 MiB` (BQ) Cohere disk figures in `compare_engines_controlled.csv` were sampled before Qdrant's background optimizer finished compaction; post-shutdown collection directories measure `804 MiB` (FP32) and `355 MiB` (BQ), versus `152 MiB` for OspreyDB.
+- **Localhost client-server transport:** OspreyDB is served via `osprey-bench-runner serve` over HTTP localhost (matching Qdrant's HTTP path, with JSON request bodies pre-serialized outside the timed loop), while `pgvector` uses SQL over localhost (`psycopg`). Under 16-worker concurrency, HTTP client queueing dominates client P99 tails for both OspreyDB and Qdrant; consult `server_p50_ms_median` and `concurrent_server_p99_ms_median` in the CSV alongside QPS.
+
+## Reproduction
+
+Requires Linux (`x86_64` with AVX-512 recommended), Python 3.10+, Rust toolchain, Docker Compose v2, and a sibling checkout of [`ospreydb/ospreydb`](https://github.com/ospreydb/ospreydb) at `../ospreydb`.
 
 ```bash
-# 1. Create Python environment and install dependencies
+# 1. Create .venv and install Python dependencies
 make setup
 
-# 2. Build native AVX-512 OspreyDB CLI + Rust benchmark runner
-#    The runner consumes the public SearchOptions::resolve API from osprey-core
-#    (commit 2e8e2f3 "feat(core): centralize adaptive low-dim oversampling policy").
-make build-rust OSPREY_SRC=/home/ramos/repositories/ospreydb/ospreydb
+# 2. Build native osprey CLI and osprey-bench-runner (-C target-cpu=native)
+make build-rust OSPREY_SRC=../ospreydb
 
-# 2b. Optional local checks (Python syntax, rustfmt, compose config)
+# 3. Validate Python scripts, Rust formatting, and Docker Compose config
 make check
 
-# 3. Run the complete benchmark suite (datasets -> Docker/MinIO -> engines ->
-#    controlled run -> LUT-Rank -> Pareto -> perf -> SVGs)
-make bench-all
+# 4. Run the recall-matched controlled benchmark (OspreyDB, Qdrant FP32/BQ, pgvector)
+make bench-compare-controlled OSPREY_SRC=../ospreydb
+
+# 5. Or run the full pipeline (datasets -> MinIO/Docker -> controlled + legacy ANN ->
+#    LUT-Rank -> WaRP S3 Pareto -> perf/ISA audit -> SVG plots)
+make bench-all OSPREY_SRC=../ospreydb
 ```
 
-### Adaptive low-dimensional oversampling (`SearchOptions::resolve`)
+Individual targets (`make datasets`, `make minio-up`, `make bench-lutrank`, `make bench-pareto`, `make profile-perf`, `make plots`) are documented in [`Makefile`](Makefile).
 
-`osprey_core::SearchOptions` centralizes Stage-1 sizing for every caller:
+### Stage-1 Sizing & Adaptive Oversampling (`SearchOptions::resolve`)
 
-| Field | Meaning |
-| :--- | :--- |
-| `nprobe` | Requested Stage-1 TSP clusters. |
-| `candidates` | Requested Stage-1 RaBitQ candidate pool (`refine_m`). `0` = policy default: `2000` for `orig_dim <= 256`, `300` otherwise. |
-| `top_k` | Final result count. |
-| `rerank_top_m` | Stage-4 survivors (`0` = disabled). |
-| `refine_multiplier` | `0` = adaptive (2x when `orig_dim <= 256`), `1` = disabled, `N > 1` = forced `Nx`. |
+`osprey-bench-runner` delegates Stage-1 candidate sizing to `osprey_core::SearchOptions::resolve` ([`rust/src/main.rs`](rust/src/main.rs)):
 
-For `orig_dim <= 256` the adaptive rule doubles `nprobe` and `candidates` and applies a
-128-vector exact-`f16` re-score floor. For `orig_dim > 256` the resolved plan is identical
-to the requested plan (`effective == requested`, `low_dim_oversample == false`).
+- When `candidates = 0` (the default when `--refine-m` is omitted), `SearchOptions::resolve` selects `2000` candidates for `orig_dim <= 256` and `300` for `orig_dim > 256`.
+- When `refine_multiplier = 0` (adaptive default), `orig_dim <= 256` doubles `nprobe` and `candidates` (`nprobe=16, refine_m=1500` → effective `32/3000` on 128d SIFT1M, bounded by the `top_m <= 4096` Stage-1 heap limit) and enforces a 128-vector exact-`f16` rescore floor. For `orig_dim > 256` (e.g., Cohere 768d), `effective == requested`.
+- Pass `--refine-multiplier 1` to disable adaptive doubling or run `make bench-compare-adaptive OSPREY_SRC=../ospreydb` / `make bench-pareto-adaptive OSPREY_SRC=../ospreydb` to reproduce the isolated A/B sweeps in `results/compare_engines_adaptive.csv` and `results/pareto_s3_adaptive.csv`.
 
-When `--refine-m` is omitted, `scripts/bench_compare_engines.py` sends `candidates = 0` and
-lets `SearchOptions::resolve` choose the dimension-aware default: SIFT1M (`d=128`) becomes
-`nprobe=32`, `candidates=2000` → resolved `64/4000`; Cohere 768d stays `32/300`. An explicit
-`--refine-m` always bypasses the auto default.
+## Published Artifacts (`results/`)
 
-The runner resolves one `SearchOptions` per `(nprobe, refine_m)` pair, passes
-`effective_nprobe` + `stage1_limit` to `OsiIndex::search_candidates`, and reports both the
-requested and resolved sizing. New flags/columns:
+- [`results/compare_engines_controlled.csv`](results/compare_engines_controlled.csv) & [`results/compare_engines_controlled.md`](results/compare_engines_controlled.md) — Recall-matched (`0.95` / `0.97`) evaluation of OspreyDB, Qdrant FP32, Qdrant 1-bit BQ, and `pgvector` FP32.
+- [`results/compare_engines.csv`](results/compare_engines.csv) & [`results/compare_engines_adaptive.csv`](results/compare_engines_adaptive.csv) — Uncalibrated default comparison and isolated `refine_multiplier` A/B sweep on SIFT1M.
+- [`results/lutrank_vs_colbert.csv`](results/lutrank_vs_colbert.csv) — `LUT-Rank` AVX-512 CPU vs. ColBERTv2 (PyTorch CPU/CUDA, ONNX Runtime, NumPy BLAS) on MS MARCO, SciFact, and FiQA.
+- [`results/pareto_s3.csv`](results/pareto_s3.csv) & [`results/pareto_s3_adaptive.csv`](results/pareto_s3_adaptive.csv) — `WaRP` ON vs. OFF Pareto sweeps over MinIO with `tc netem 15ms`.
+- [`results/sift1m_adaptive_recall_recovery.json`](results/sift1m_adaptive_recall_recovery.json) — Stage-1 adaptive oversampling recall recovery telemetry on SIFT1M.
+- [`results/perf/`](results/perf/) — `perf stat` / `rusage` logs, `objdump` AVX-512 instruction counts (`prefetcht0`, `vpopcntq`, `vpshufb`, `vpternlogq`), and JSON stage breakdowns.
+- [`results/figures/`](results/figures/) — Vector SVG plots (`fig1`–`fig7`) generated by [`scripts/generate_plots.py`](scripts/generate_plots.py).
 
-- `osprey-bench-runner search-eval --refine-multiplier <0|1|N>` (default `0`);
-  `--refine-list` accepts `0` to request the auto candidate default.
-- `SearchEvalPoint` adds `requested_nprobe`, `effective_nprobe`, `requested_candidates`,
-  `effective_candidates`, `refine_limit`, `stage1_limit`, `auto_candidates`,
-  `resolved refine_multiplier`, `orig_dim`, and `low_dim_oversample`.
-- `scripts/bench_compare_engines.py --refine-multiplier <...> [--refine-m N] [--out-csv PATH]`
-  and `scripts/bench_pareto_s3.py --refine-multiplier <...> [--out-csv PATH]` forward the
-  policy to the runner. `--refine-multiplier` accepts multiple values to sweep policies in
-  one run and tags each row with `refine_policy` + `requested_refine_multiplier`; the compare
-  script also writes `candidates_mode=auto|explicit`.
-- Core constraint: `OsiIndex::search_candidates` rejects `top_m > 4096`
-  (`crates/osprey-core/src/rabitq.rs`). The low-dim auto default resolves to `4000`, which
-  fits; adaptive doubling therefore only works up to `candidates <= 2048` per request.
-- Measured on the prepared `SIFT1M` index (`1M × 128`, `K=256`): the official auto default
-  (`32/2000` → `64/4000`) reaches `Recall@10 = 0.969`. The isolated A/B at `8/64` still
-  raises recall from `0.415` to `0.5505` but is intentionally below `0.95`; there the
-  candidate pool, not `nprobe`, is the limiter.
+## License
 
-Official comparison (refreshes the published `results/compare_engines.csv` with auto defaults):
-```bash
-make bench-compare
-```
-
-### Controlled, recall-matched comparison (`--controlled`)
-
-`scripts/bench_controlled.py` (invoked by `scripts/bench_compare_engines.py --controlled`)
-removes the main methodological biases of the legacy comparison:
-
-- Calibrates on 25% of the query file (minimum 200 validation queries), requires
-  `Recall@10 >= target` on validation for `0.95` and `0.97`, then selects the cheapest
-  configuration and reports `ok` or `below_target`. The old `target - 0.005` tolerance was
-  removed because it selected configurations that missed the target on the test split.
-- Uses HTTP client-server for OspreyDB (`osprey-bench-runner serve`) and Qdrant, and SQL
-  client-server for pgvector. No in-process Osprey timing.
-- Runs 200 warmup plus all remaining test queries (up to 1000) in 3 independent rounds,
-  without repeating queries. Reports median and standard deviation of P50/P95/P99,
-  concurrent P50/P95/P99, and concurrent QPS with 16 workers.
-- Precomputes JSON request bodies for OspreyDB/Qdrant outside the timed loop, so the HTTP
-  engines do not pay Python serialization cost per query. pgvector already uses
-  precomputed SQL literals.
-- Reports `VmHWM` for the OspreyDB process and cgroup v2 `memory.peak` for Docker
-  containers. The container metric includes page-cache-resident indexes, which fixes the
-  pgvector RSS undercount.
-- Starts exactly one engine at a time: Qdrant/pgvector containers are stopped before the
-  next engine starts and after each dataset, so background optimization or autovacuum from
-  one engine cannot contaminate another engine's stage.
-
-Prepared data: SIFT1M (`1M × 128`, 1500 queries) and Cohere 768d (`100k × 768`, 1000
-queries). All vectors are L2-normalized, so cosine and inner-product rankings are identical
-for Qdrant/pgvector and OspreyDB.
-
-Fairness caveats:
-
-- Cohere is the 100k subset, not 1M. With the automatic split, Cohere uses 250 calibration,
-  200 warmup, and 550 test queries; measured counts are written to the CSV and no query is
-  repeated.
-- OspreyDB runs with a bounded 256 MB cache (`--controlled-cache-mb 256`) while
-  Qdrant/pgvector keep their full indexes in RAM. This favors the competitors on latency
-  and is intentional: it measures OspreyDB's bounded-RAM path. The reported peak-memory
-  metric makes the trade-off explicit.
-- The engines use different index families (OspreyDB 1-bit RaBitQ + f16 rescore, HNSW FP32,
-  and HNSW 1-bit BQ + rescore). Recall is matched, not the algorithm. Qdrant BQ is included
-  as a negative result where it cannot reach the target (notably 128-d SIFT).
-- QPS is throughput with 16 async workers, not a server-only ranking. Request serialization
-  is now outside the timed loop, but HTTP (OspreyDB/Qdrant) and SQL (pgvector) still differ;
-  use server P50 and concurrent latency alongside QPS.
-- There is no CPU pinning or cgroup isolation; run on an idle machine for publication
-  numbers. Cohere 768d at 100k is the supported scale in this repository.
-
-The full SIFT1M + Cohere run rebuilds four indexes and calibrates an on-disk HNSW index, so
-it takes tens of minutes on a spinning disk. Progress is printed per calibration
-configuration and per measurement round; the Python entrypoint line-buffers stdout even
-when piped through `tee`. Use `--quick` or restrict `--datasets`/`--engines` for a fast
-sanity check.
-
-```bash
-# Build both binaries against the local core checkout.
-make build-rust OSPREY_SRC=/home/ramos/repositories/ospreydb/ospreydb
-
-# Smoke test: small grids and splits.
-.venv/bin/python3 scripts/bench_compare_engines.py --controlled --quick \
-  --datasets cohere768d \
-  --osprey-bin /home/ramos/repositories/ospreydb/ospreydb/target/release/osprey \
-  --runner-bin rust/target/release/osprey-bench-runner \
-  --out-controlled-csv /tmp/controlled_smoke.csv
-
-# Full controlled run (writes results/compare_engines_controlled.csv).
-make bench-compare-controlled
-
-# Equivalent explicit invocation.
-.venv/bin/python3 scripts/bench_compare_engines.py --controlled \
-  --datasets sift1m cohere768d --recall-target 0.95 0.97 \
-  --engines osprey,qdrant_fp32,qdrant_bq,pgvector \
-  --workers 16 --warmup-queries 200 --measure-queries 1000 --rounds 3 \
-  --controlled-cache-mb 256 \
-  --osprey-bin /home/ramos/repositories/ospreydb/ospreydb/target/release/osprey \
-  --runner-bin rust/target/release/osprey-bench-runner \
-  --out-controlled-csv results/compare_engines_controlled.csv
-```
-
-### Controlled results (2026-11-17)
-
-Published run: [`results/compare_engines_controlled.md`](results/compare_engines_controlled.md),
-raw data in [`results/compare_engines_controlled.csv`](results/compare_engines_controlled.csv).
-
-- **SIFT1M:** Qdrant FP32 is `3.5–3.9x` faster than OspreyDB in client P50
-  (`0.85–0.89 ms` vs `2.98–3.43 ms`), but uses `9.1x` more peak memory
-  (`4194 MiB` vs `462 MiB`) and `4.1x` more disk (`868 MiB` vs `213 MiB`).
-  pgvector matches OspreyDB latency (`2.37–3.26 ms`) with higher QPS, but uses
-  `2594 MiB` peak memory and `2144 MiB` disk.
-- **Cohere 100k:** OspreyDB (`0.80–0.97 ms`, `235 MiB`, `152 MiB` disk) and
-  Qdrant FP32 (`0.70–0.86 ms`, `2731 MiB`, `~804 MiB` disk after compaction)
-  are close in latency; OspreyDB uses `11.6x` less peak memory and `~5x` less
-  disk.
-- **Quantization:** Qdrant 1-bit BQ does not reach `0.95` on either dataset
-  (`0.062` SIFT test recall, `0.934` Cohere). OspreyDB's 1-bit RaBitQ + f16
-  rescore reaches `0.974` (SIFT) and `0.989` (Cohere).
-- **Calibration note:** OspreyDB SIFT `0.97` is marked `below_target` because
-  validation reached `0.968`; its measured test recall is `0.9738`.
-
-Controlled figures (regenerated from `compare_engines_controlled.csv`):
-[peak memory and disk](results/figures/fig1_memory_disk_controlled.svg),
-[recall vs latency](results/figures/fig2_recall_latency_controlled.svg),
-[build time](results/figures/fig3_build_time_controlled.svg),
-[validation vs test recall](results/figures/fig4_validation_test_recall_controlled.svg).
-
-Isolated A/B and Pareto commands (write new files, leaving the published CSVs intact):
-```bash
-# SIFT1M baseline (8/64) vs adaptive (16/128)
-make bench-compare-adaptive
-# equivalent explicit invocation
-.venv/bin/python3 scripts/bench_compare_engines.py \
-  --datasets sift1m --nprobe 8 --refine-m 64 --refine-multiplier 1 0 \
-  --skip-qdrant --skip-pgvector \
-  --osprey-bin /home/ramos/repositories/ospreydb/ospreydb/target/release/osprey \
-  --runner-bin rust/target/release/osprey-bench-runner \
-  --out-csv results/compare_engines_adaptive.csv
-
-# SIFT1M MinIO Pareto sweep, both policies
-make bench-pareto-adaptive
-```
-
-> **Note on `perf stat` and `cargo flamegraph`:** Hardware PMU counters (`cycles`, `instructions`, `L1-dcache-load-misses`, `LLC-load-misses`, `branch-misses`) and kernel-sampled CPU flamegraphs require `kernel.perf_event_paranoid <= 1` (or `CAP_PERFMON`). When `perf_event_paranoid > 1`, `scripts/profile_perf.sh` logs the kernel restriction, records `/usr/bin/time -v` OS telemetry + `osprey --json` stage breakdowns, and runs an `objdump` ISA audit verifying `prefetcht0`, `vpopcntq`, `vpshufb`, and `vpternlogq` emission.
-
-## 3. Published Artifacts (`results/`)
-
-- `results/compare_engines.csv` — OspreyDB vs. Qdrant vs. `pgvector` across SIFT & Cohere 768d, using the adaptive auto candidate default (`candidates=0`).
-- `results/compare_engines_controlled.csv` — recall-matched controlled run (`0.95`/`0.97`) with isolated engines, unified peak-memory metric, concurrent latency, and no repeated test queries.
-- `results/compare_engines_controlled.md` — protocol, full result tables, analysis, and caveats for the controlled run.
-- `results/compare_engines_adaptive.csv` — isolated SIFT1M A/B for `refine_multiplier=1` (baseline, 8/64) vs `0` (adaptive, 16/128), plus Cohere 768d no-op rows.
-- `results/pareto_s3.csv` — 39-point `nprobe × refine_m` sweep against MinIO with `tc netem 15ms` (`WaRP` ON vs OFF).
-- `results/pareto_s3_adaptive.csv` — SIFT1M Pareto sweep for `refine_multiplier` 1 and 0, with requested/effective sizing per point.
-- `results/lutrank_vs_colbert.csv` — `LUT-Rank` CPU vs. ColBERTv2 latency, QPS, `NDCG@10`, and `MRR@10`.
-- `results/perf/` — `perf stat` / `rusage` logs, ISA disassembly counts, and flamegraph status.
-- `results/figures/` — Vector SVG figures generated by `make plots`:
-  - Controlled run: `fig1_memory_disk_controlled.svg`, `fig2_recall_latency_controlled.svg`, `fig3_build_time_controlled.svg`, `fig4_validation_test_recall_controlled.svg`.
-  - S3/WaRP: `fig5_warp_s3_requests_16x.svg`, `fig7_pareto_recall_latency_s3.svg`.
-  - LUT-Rank: `fig6_lutrank_cpu_vs_gpu.svg`.
-
-## 4. License
-
-Apache-2.0. See [`LICENSE`](LICENSE).
+Licensed under the [Apache License, Version 2.0](./LICENSE).
