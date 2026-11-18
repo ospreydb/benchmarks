@@ -159,6 +159,13 @@ def bench_colbert_numpy_cpu(
     mrr_sum = 0.0
     qrel_cnt = 0
 
+    # Warmup BLAS/CPU caches
+    for q, cands in zip(queries[:3], cands_list[:3]):
+        qt_w = np.asarray(q["tokens"], dtype=np.float32)
+        for did in cands:
+            _ = qt_w @ tokens_by_doc[did].T
+
+    scored_all = []
     wall_t0 = time.perf_counter()
     for q, cands in zip(queries, cands_list):
         qt = np.asarray(q["tokens"], dtype=np.float32)  # [Lq, 128]
@@ -171,12 +178,15 @@ def bench_colbert_numpy_cpu(
             scored.append((did, score))
         scored.sort(key=lambda x: (-x[1], x[0]))
         latencies_ms.append((time.perf_counter() - t0) * 1000.0)
+        scored_all.append((q, scored))
+    wall_s = time.perf_counter() - wall_t0
+
+    for q, scored in scored_all:
         if q.get("qrels"):
             qrel_cnt += 1
             ndcg, mrr = eval_ndcg_mrr([d for d, _ in scored], q["qrels"])
             ndcg_sum += ndcg
             mrr_sum += mrr
-    wall_s = time.perf_counter() - wall_t0
     arr = np.sort(np.asarray(latencies_ms))
     raw_mb = sum(v.nbytes for v in tokens_by_doc.values()) / (1024.0 * 1024.0)
 
@@ -238,6 +248,7 @@ def bench_colbert_pytorch(
         if device_str == "cuda":
             torch.cuda.synchronize()
 
+        scored_all = []
         wall_t0 = time.perf_counter()
         for q, cands in zip(queries, cands_list):
             t0 = time.perf_counter()
@@ -252,16 +263,20 @@ def bench_colbert_pytorch(
             score_list = scores.float().cpu().tolist()
             scored = sorted(zip(cands, score_list), key=lambda x: (-x[1], x[0]))
             latencies_ms.append((time.perf_counter() - t0) * 1000.0)
-            if q.get("qrels"):
-                qrel_cnt += 1
-                ndcg, mrr = eval_ndcg_mrr([d for d, _ in scored], q["qrels"])
-                ndcg_sum += ndcg
-                mrr_sum += mrr
+            scored_all.append((q, scored))
     if device_str == "cuda":
         torch.cuda.synchronize()
     wall_s = time.perf_counter() - wall_t0
+
+    for q, scored in scored_all:
+        if q.get("qrels"):
+            qrel_cnt += 1
+            ndcg, mrr = eval_ndcg_mrr([d for d, _ in scored], q["qrels"])
+            ndcg_sum += ndcg
+            mrr_sum += mrr
     arr = np.sort(np.asarray(latencies_ms))
-    raw_mb = sum(v.nbytes for v in tokens_by_doc.values()) / (1024.0 * 1024.0)
+    bytes_per_elem = 2 if dtype == torch.float16 else 4
+    raw_mb = sum(v.size * bytes_per_elem for v in tokens_by_doc.values()) / (1024.0 * 1024.0)
     label = "PyTorch CUDA GPU" if device_str == "cuda" else "PyTorch CPU"
     return {
         "dataset": dataset,
@@ -346,6 +361,7 @@ def bench_colbert_onnx(
         docs_w = np.stack([doc_pad_cache[did] for did in cands], axis=0)
         _ = sess.run(["scores"], {"qt": qt_w, "docs": docs_w})
 
+    scored_all = []
     wall_t0 = time.perf_counter()
     for q, cands in zip(queries, cands_list):
         t0 = time.perf_counter()
@@ -354,12 +370,15 @@ def bench_colbert_onnx(
         scores = sess.run(["scores"], {"qt": qt, "docs": batch_docs})[0]
         scored = sorted(zip(cands, scores.tolist()), key=lambda x: (-x[1], x[0]))
         latencies_ms.append((time.perf_counter() - t0) * 1000.0)
+        scored_all.append((q, scored))
+    wall_s = time.perf_counter() - wall_t0
+
+    for q, scored in scored_all:
         if q.get("qrels"):
             qrel_cnt += 1
             ndcg, mrr = eval_ndcg_mrr([d for d, _ in scored], q["qrels"])
             ndcg_sum += ndcg
             mrr_sum += mrr
-    wall_s = time.perf_counter() - wall_t0
     arr = np.sort(np.asarray(latencies_ms))
     raw_mb = sum(v.nbytes for v in tokens_by_doc.values()) / (1024.0 * 1024.0)
     return {

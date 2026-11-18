@@ -216,7 +216,7 @@ def main() -> int:
             "16,24,32",
             "100,150,200",
             refine_multiplier,
-            min(25, args.max_queries),
+            args.max_queries,
             True,
             warp_off_json,
             env,

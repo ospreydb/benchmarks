@@ -762,12 +762,14 @@ fn run_lutrank_eval(
 
     let simd = SimdEngine::new_auto();
     let mut lut_synth_us = Vec::with_capacity(q_count);
-    let mut latencies_ms = Vec::with_capacity(q_count);
-    let mut ndcg_sum = 0.0_f64;
-    let mut mrr_sum = 0.0_f64;
-    let mut qrel_queries = 0_usize;
+    struct PreparedLutQuery<'a> {
+        flat_tokens: Vec<f32>,
+        num_tokens: usize,
+        cand_ids: Vec<u64>,
+        qrels: &'a HashMap<String, i64>,
+    }
 
-    let wall_start = Instant::now();
+    let mut prepared = Vec::with_capacity(q_count);
     for (qi, q) in queries.iter().take(q_count).enumerate() {
         let mut flat_tokens = Vec::with_capacity(q.tokens.len() * token_dim);
         for tok in &q.tokens {
@@ -795,12 +797,42 @@ fn run_lutrank_eval(
             }
             cursor = (cursor + 17) % (num_docs as u64);
         }
+        prepared.push(PreparedLutQuery {
+            flat_tokens,
+            num_tokens: q.tokens.len(),
+            cand_ids,
+            qrels: &q.qrels,
+        });
+    }
 
+    // Warmup mmap pages and CPU caches (3 queries, matching PyTorch/ONNX baselines).
+    for pq in prepared.iter().take(3.min(q_count)) {
+        let q_lut = QuantizedQueryLut::synthesize(
+            &pq.flat_tokens,
+            pq.num_tokens,
+            token_dim,
+            hdr.gamma,
+            hdr.fwht_seed,
+            &simd,
+        )
+        .map_err(|e| e.to_string())?;
+        for &doc_id in &pq.cand_ids {
+            let _ = osr
+                .score_doc_id_maxsim(doc_id, &q_lut, &simd)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    let mut latencies_ms = Vec::with_capacity(q_count);
+    let mut all_scored: Vec<(Vec<(u64, f32)>, &HashMap<String, i64>)> = Vec::with_capacity(q_count);
+
+    let wall_start = Instant::now();
+    for pq in &prepared {
         let t0 = Instant::now();
         let t_lut = Instant::now();
         let q_lut = QuantizedQueryLut::synthesize(
-            &flat_tokens,
-            q.tokens.len(),
+            &pq.flat_tokens,
+            pq.num_tokens,
             token_dim,
             hdr.gamma,
             hdr.fwht_seed,
@@ -809,9 +841,9 @@ fn run_lutrank_eval(
         .map_err(|e| e.to_string())?;
         lut_synth_us.push(t_lut.elapsed().as_secs_f64() * 1_000_000.0);
 
-        let mut scored: Vec<(u64, f32)> = Vec::with_capacity(cand_ids.len());
-        for (idx, &doc_id) in cand_ids.iter().enumerate() {
-            if let Some(&next_id) = cand_ids.get(idx + 1) {
+        let mut scored: Vec<(u64, f32)> = Vec::with_capacity(pq.cand_ids.len());
+        for (idx, &doc_id) in pq.cand_ids.iter().enumerate() {
+            if let Some(&next_id) = pq.cand_ids.get(idx + 1) {
                 osr.prefetch_doc_id(next_id, &simd);
             }
             let sc = osr
@@ -822,15 +854,22 @@ fn run_lutrank_eval(
         }
         scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         latencies_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+        all_scored.push((scored, pq.qrels));
+    }
+    let total_wall_s = wall_start.elapsed().as_secs_f64();
 
-        if !q.qrels.is_empty() {
+    let mut ndcg_sum = 0.0_f64;
+    let mut mrr_sum = 0.0_f64;
+    let mut qrel_queries = 0_usize;
+    for (scored, qrels) in &all_scored {
+        if !qrels.is_empty() {
             qrel_queries += 1;
             let rels: Vec<f64> = scored
                 .iter()
                 .take(top_k)
-                .map(|(did, _)| q.qrels.get(&did.to_string()).copied().unwrap_or(0).max(0) as f64)
+                .map(|(did, _)| qrels.get(&did.to_string()).copied().unwrap_or(0).max(0) as f64)
                 .collect();
-            let mut ideal_rels: Vec<f64> = q.qrels.values().map(|&v| v.max(0) as f64).collect();
+            let mut ideal_rels: Vec<f64> = qrels.values().map(|&v| v.max(0) as f64).collect();
             ideal_rels.sort_by(f64::total_cmp);
             ideal_rels.reverse();
 
@@ -845,9 +884,7 @@ fn run_lutrank_eval(
                 }
             }
         }
-        let _ = &q.query_id;
     }
-    let total_wall_s = wall_start.elapsed().as_secs_f64();
     latencies_ms.sort_by(f64::total_cmp);
 
     let report = LutrankEvalReport {

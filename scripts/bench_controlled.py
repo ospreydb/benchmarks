@@ -77,6 +77,12 @@ def mean_std(vals: Sequence[float]) -> Tuple[float, float]:
     return float(statistics.mean(vals)), float(statistics.pstdev(vals))
 
 
+def median_std(vals: Sequence[float]) -> Tuple[float, float]:
+    if not vals:
+        return 0.0, 0.0
+    return float(statistics.median(vals)), float(statistics.pstdev(vals))
+
+
 def recall_at_k(pred_ids: Sequence[Sequence[int]], gt: np.ndarray, k: int = 10) -> float:
     hits = 0
     denom = 0
@@ -1042,13 +1048,11 @@ class PgvectorEngine:
 
     def disk_mb(self) -> float:
         with psycopg.connect(PGVECTOR_DSN, autocommit=True) as conn:
-            cur = conn.execute(
-                f"SELECT pg_total_relation_size('{self.table}'), "
-                f"pg_relation_size('{self.table}_hnsw_idx');"
-            )
+            # pg_total_relation_size already includes heap, TOAST, and all indexes (incl. HNSW).
+            cur = conn.execute(f"SELECT pg_total_relation_size('{self.table}');")
             row = cur.fetchone()
             if row:
-                return (int(row[0]) + int(row[1])) / (1024.0 * 1024.0)
+                return int(row[0]) / (1024.0 * 1024.0)
         return 0.0
 
 
@@ -1274,7 +1278,7 @@ def measure_generic(
             )
 
         def med_std(key: str) -> Tuple[float, float]:
-            return mean_std([r[key] for r in round_stats])
+            return median_std([r[key] for r in round_stats])
 
         summary: Dict[str, Any] = {"rounds": round_stats}
         for key in (
