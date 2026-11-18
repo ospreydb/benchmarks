@@ -493,31 +493,99 @@ def plot_fig7_pareto() -> None:
     if not warp_on:
         return
 
-    fig, ax = plt.subplots(figsize=(7.2, 4.8))
+    fig, ax = plt.subplots(figsize=(8.0, 5.2))
     nprobes = sorted(set(int(r["nprobe"]) for r in warp_on))
     cmap = plt.get_cmap("viridis")
 
+    all_pts = []
     for i, np_val in enumerate(nprobes):
-        pts = sorted([r for r in warp_on if int(r["nprobe"]) == np_val], key=lambda r: int(r["refine_m"]))
+        pts = sorted(
+            [r for r in warp_on if int(r["nprobe"]) == np_val],
+            key=lambda r: int(r["refine_m"]),
+        )
         lats = [float(r["p50_ms"]) for r in pts]
         recs = [float(r["recall_at_10"]) * 100.0 for r in pts]
         gets = [float(r["avg_s3_gets"]) for r in pts]
         color = cmap(i / max(1, len(nprobes) - 1))
-        ax.plot(lats, recs, marker="o", lw=1.6, color=color, label=f"nprobe={np_val}")
+        ax.plot(
+            lats,
+            recs,
+            marker="o",
+            markersize=4.5,
+            lw=1.25,
+            alpha=0.55,
+            color=color,
+            label=f"nprobe={np_val}",
+            zorder=2,
+        )
         for x_v, y_v, g_v, r in zip(lats, recs, gets, pts):
-            ax.annotate(
-                f"m={r['refine_m']} ({g_v:.1f} GETs)",
-                (x_v, y_v),
-                textcoords="offset points",
-                xytext=(4, 4),
-                fontsize=7,
-                alpha=0.85,
-            )
+            all_pts.append((np_val, int(r["refine_m"]), x_v, y_v, g_v, color))
 
+    # Compute Pareto-optimal frontier (minimize P50 latency, maximize Recall@10)
+    pareto = []
+    for p in all_pts:
+        dominated = any(
+            q[2] <= p[2] and q[3] >= p[3] and (q[2] < p[2] or q[3] > p[3])
+            for q in all_pts
+        )
+        if not dominated:
+            pareto.append(p)
+    pareto.sort(key=lambda p: p[2])
+
+    ax.plot(
+        [p[2] for p in pareto],
+        [p[3] for p in pareto],
+        color="#0F172A",
+        lw=2.0,
+        linestyle="--",
+        label="Pareto frontier",
+        zorder=4,
+    )
+    for np_val, m_val, x_v, y_v, g_v, color in pareto:
+        ax.scatter(
+            [x_v],
+            [y_v],
+            s=64,
+            color=color,
+            edgecolors="#0F172A",
+            linewidths=1.3,
+            zorder=5,
+        )
+
+    # Custom non-overlapping offsets (in points) for Pareto-optimal points.
+    # Omit redundant ultra-close label on (24, 150) which sits 0.3ms from (48, 100).
+    offsets = {
+        (4, 150): (16, -2),
+        (8, 300): (16, -4),
+        (16, 200): (10, -18),
+        (32, 100): (-68, 14),
+        (48, 100): (-78, 16),
+        (32, 150): (10, -18),
+        (48, 150): (-72, 14),
+        (48, 300): (10, 8),
+    }
+    for np_val, m_val, x_v, y_v, g_v, _ in pareto:
+        if (np_val, m_val) not in offsets:
+            continue
+        dx, dy = offsets[(np_val, m_val)]
+        ax.annotate(
+            f"{np_val}/{m_val} ({g_v:.1f} GETs)",
+            (x_v, y_v),
+            textcoords="offset points",
+            xytext=(dx, dy),
+            fontsize=7.8,
+            color="#0F172A",
+            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="#CBD5E1", alpha=0.92, lw=0.7),
+            arrowprops=dict(arrowstyle="-", color="#64748B", lw=0.8),
+            zorder=6,
+        )
+
+    ax.set_xlim(48, 114)
+    ax.set_ylim(69.5, 99.8)
     ax.set_xlabel("P50 Query Latency Over MinIO tc netem (ms)")
     ax.set_ylabel("Recall@10 (%)")
-    ax.set_title("Pareto Frontier: Recall@10 vs Latency vs S3 GETs (nprobe × refine_m)")
-    ax.legend(frameon=True, fontsize=8.5, loc="lower right")
+    ax.set_title("Pareto Frontier: Recall@10 vs Latency vs S3 GETs (Cohere 768d, WaRP ON)")
+    ax.legend(frameon=True, fontsize=8.5, loc="lower right", ncol=2)
 
     fig.tight_layout()
     out = FIG_DIR / "fig7_pareto_recall_latency_s3.svg"
