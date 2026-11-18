@@ -414,7 +414,10 @@ def main() -> int:
         default=[0.95, 0.97],
         help="Recall@10 targets calibrated on the validation split.",
     )
-    parser.add_argument("--engines", default="osprey,qdrant_fp32,qdrant_bq,pgvector")
+    parser.add_argument(
+        "--engines",
+        default="osprey,qdrant_fp32,qdrant_sq8,qdrant_bq,pgvector,pgvector_halfvec",
+    )
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument(
         "--calib-queries",

@@ -23,6 +23,8 @@ artifacts/
 # Docker volumes
 docker/minio-data/
 docker/qdrant-data/
+docker/qdrant-bq-data/
+docker/qdrant-sq8-data/
 docker/pgvector-data/
 
 # Temporary profiling data

@@ -38,6 +38,9 @@ from qdrant_client.models import (
     HnswConfigDiff,
     OptimizersConfigDiff,
     PointStruct,
+    ScalarQuantization,
+    ScalarQuantizationConfig,
+    ScalarType,
     VectorParams,
 )
 
@@ -48,11 +51,17 @@ RESULTS_DIR = ROOT / "results"
 COMPOSE_FILE = ROOT / "docker" / "docker-compose.yml"
 TMP_DIR = Path("/tmp/kilo")
 
+QDRANT_FP32_CONTAINER = "osprey-bench-qdrant"
 QDRANT_FP32_URL = "http://127.0.0.1:6333"
+QDRANT_FP32_DATA = ROOT / "docker" / "qdrant-data"
 QDRANT_BQ_NAME = "osprey-bench-qdrant-bq"
 QDRANT_BQ_PORT = 6335
-QDRANT_BQ_DATA = TMP_DIR / "qdrant-bq-data"
+QDRANT_BQ_DATA = ROOT / "docker" / "qdrant-bq-data"
+QDRANT_SQ8_NAME = "osprey-bench-qdrant-sq8"
+QDRANT_SQ8_PORT = 6337
+QDRANT_SQ8_DATA = ROOT / "docker" / "qdrant-sq8-data"
 PGVECTOR_CONTAINER = "osprey-bench-pgvector"
+PGVECTOR_DATA = ROOT / "docker" / "pgvector-data"
 PGVECTOR_DSN = "postgresql://osprey:ospreypassword123@127.0.0.1:5433/osprey_bench"
 
 
@@ -94,13 +103,15 @@ def recall_at_k(pred_ids: Sequence[Sequence[int]], gt: np.ndarray, k: int = 10) 
 
 
 def dir_size_mb(path: Path) -> float:
+    """Measure allocated on-disk bytes (`st_blocks * 512`) to avoid overcounting sparse holes."""
     if not path.exists():
         return 0.0
     total = 0
     for p in path.rglob("*"):
         if p.is_file():
             try:
-                total += p.stat().st_size
+                st = p.stat()
+                total += st.st_blocks * 512 if hasattr(st, "st_blocks") else st.st_size
             except OSError:
                 pass
     return total / (1024.0 * 1024.0)
@@ -136,6 +147,114 @@ def container_pids(name: str) -> List[int]:
 
 def container_max_vmhwm_kb(name: str) -> int:
     return max((read_vmhwm_kb(pid) for pid in container_pids(name)), default=0)
+
+
+_SYSTEMD_SCOPE_OK: Optional[bool] = None
+
+
+def has_systemd_user_scope() -> bool:
+    global _SYSTEMD_SCOPE_OK
+    if _SYSTEMD_SCOPE_OK is None:
+        try:
+            res = subprocess.run(
+                [
+                    "systemd-run",
+                    "--user",
+                    "--scope",
+                    "--quiet",
+                    "-p",
+                    "MemoryAccounting=yes",
+                    "true",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+            _SYSTEMD_SCOPE_OK = res.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            _SYSTEMD_SCOPE_OK = False
+    return _SYSTEMD_SCOPE_OK
+
+
+def read_pid_cgroup_peak_kb(pid: int) -> int:
+    """Read cgroup v2 memory.peak (RSS + page cache) for a live process PID."""
+    try:
+        for line in Path(f"/proc/{pid}/cgroup").read_text().splitlines():
+            parts = line.split(":", 2)
+            if len(parts) == 3 and parts[2]:
+                peak_file = Path(f"/sys/fs/cgroup{parts[2]}/memory.peak")
+                if peak_file.exists():
+                    return int(peak_file.read_text().strip()) // 1024
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def drop_path_page_cache(target: Path) -> None:
+    """Evict readable regular files under `target` from the Linux host page cache."""
+    if not target.exists():
+        return
+    files = [target] if target.is_file() else [p for p in target.rglob("*") if p.is_file()]
+    for path in files:
+        try:
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+
+
+def run_rust_http_load(
+    runner_bin: str,
+    url: str,
+    engine: str,
+    payloads: Sequence[bytes],
+    workers: int,
+) -> Tuple[List[List[int]], List[float], List[float], float]:
+    """Run sequential (workers=1) or concurrent (workers=N) HTTP load via Rust."""
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    payload_path = TMP_DIR / f"http_load_{engine}_{os.getpid()}.jsonl"
+    out_path = TMP_DIR / f"http_load_{engine}_{os.getpid()}_out.json"
+    with open(payload_path, "wb") as fh:
+        for p in payloads:
+            fh.write(p)
+            fh.write(b"\n")
+    try:
+        subprocess.run(
+            [
+                runner_bin,
+                "http-load",
+                "--url",
+                url,
+                "--engine",
+                engine,
+                "--payloads-file",
+                str(payload_path),
+                "--workers",
+                str(workers),
+                "--out-json",
+                str(out_path),
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        report = json.loads(out_path.read_text())
+        return (
+            [[int(x) for x in row] for row in report["doc_ids"]],
+            [float(x) for x in report["client_ms"]],
+            [float(x) for x in report["server_ms"]],
+            float(report["wall_s"]),
+        )
+    finally:
+        for p in (payload_path, out_path):
+            try:
+                p.unlink()
+            except OSError:
+                pass
 
 
 def container_peak_memory_kb(name: str) -> int:
@@ -217,9 +336,43 @@ def wait_http(url: str, timeout: float = 180.0) -> None:
 def measure_cmd_peak_rss(
     cmd: Sequence[str], env: Optional[Dict[str, str]] = None
 ) -> Tuple[float, float]:
+    """Run command inside a user cgroup scope (if available) and return (elapsed_s, peak_mb)."""
     merged_env = os.environ.copy()
     if env:
         merged_env.update(env)
+    if has_systemd_user_scope():
+        unit = f"osprey-cmd-{os.getpid()}-{int(time.time() * 1000)}"
+        scoped_cmd = [
+            "systemd-run",
+            "--user",
+            "--scope",
+            "--quiet",
+            f"--unit={unit}",
+            "-p",
+            "MemoryAccounting=yes",
+            *cmd,
+        ]
+        started = time.perf_counter()
+        proc = subprocess.Popen(
+            scoped_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=merged_env,
+        )
+        sampler = RssSampler(
+            lambda: max(read_pid_cgroup_peak_kb(proc.pid), read_vmhwm_kb(proc.pid)),
+            interval=0.1,
+        )
+        sampler.start()
+        stdout, stderr = proc.communicate()
+        peak_kb = sampler.stop()
+        elapsed = time.perf_counter() - started
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"command failed ({proc.returncode}): {' '.join(cmd)}\n{stderr}\n{stdout}"
+            )
+        return elapsed, peak_kb / 1024.0
     time_bin = "/usr/bin/time"
     started = time.perf_counter()
     if os.path.exists(time_bin):
@@ -318,7 +471,38 @@ def stop_pgvector() -> None:
 def stop_all_engines() -> None:
     stop_qdrant_fp32()
     stop_pgvector()
-    stop_qdrant_bq_container()
+    stop_qdrant_dedicated_container(QDRANT_BQ_NAME)
+    stop_qdrant_dedicated_container(QDRANT_SQ8_NAME)
+
+
+def restart_qdrant_fp32() -> None:
+    stop_qdrant_fp32()
+    drop_path_page_cache(QDRANT_FP32_DATA)
+    start_qdrant_fp32()
+
+
+def drop_pgvector_page_cache_and_restart() -> None:
+    """Checkpoint PostgreSQL, stop container, drop host page cache on pgdata, and start fresh cgroup."""
+    with psycopg.connect(PGVECTOR_DSN, autocommit=True) as conn:
+        conn.execute("CHECKPOINT;")
+    stop_pgvector()
+    subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{PGVECTOR_DATA.resolve()}:/pgdata",
+            "--entrypoint=",
+            "pgvector/pgvector:pg16",
+            "sh",
+            "-c",
+            "find /pgdata -type f -exec dd if={} of=/dev/null iflag=nocache count=0 status=none \\; 2>/dev/null || true",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    start_pgvector()
 
 
 def clear_pg_tables() -> None:
@@ -330,39 +514,63 @@ def clear_pg_tables() -> None:
             conn.execute(f'DROP TABLE IF EXISTS "{table}" CASCADE;')
 
 
-def start_qdrant_bq_container() -> None:
+def start_qdrant_dedicated_container(name: str, port: int, data_dir: Path) -> None:
     subprocess.run(
-        ["docker", "rm", "-f", QDRANT_BQ_NAME],
+        ["docker", "rm", "-f", name],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    QDRANT_BQ_DATA.mkdir(parents=True, exist_ok=True)
-    os.chmod(QDRANT_BQ_DATA, 0o777)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(data_dir, 0o777)
+    # Clean root-owned files from previous container runs before starting fresh.
+    subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{data_dir.resolve()}:/qdrant/storage",
+            "--entrypoint=",
+            "qdrant/qdrant:latest",
+            "sh",
+            "-c",
+            "rm -rf /qdrant/storage/* /qdrant/storage/.[!.]*",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    # Create without --rm so stop+start isolates build vs query cgroups cleanly.
     subprocess.run(
         [
             "docker",
             "run",
             "-d",
-            "--rm",
             "--name",
-            QDRANT_BQ_NAME,
+            name,
             "-p",
-            f"{QDRANT_BQ_PORT}:6333",
+            f"{port}:6333",
             "-p",
-            f"{QDRANT_BQ_PORT + 1}:6334",
+            f"{port + 1}:6334",
             "-v",
-            f"{QDRANT_BQ_DATA}:/qdrant/storage",
+            f"{data_dir}:/qdrant/storage",
             "qdrant/qdrant:latest",
         ],
         check=True,
         stdout=subprocess.DEVNULL,
     )
-    wait_http(f"http://127.0.0.1:{QDRANT_BQ_PORT}/", timeout=180)
+    wait_http(f"http://127.0.0.1:{port}/", timeout=180)
 
 
-def stop_qdrant_bq_container() -> None:
+def restart_qdrant_dedicated_container(name: str, port: int, data_dir: Path) -> None:
+    stop_container(name)
+    drop_path_page_cache(data_dir)
+    start_container(name)
+    wait_http(f"http://127.0.0.1:{port}/", timeout=180)
+
+
+def stop_qdrant_dedicated_container(name: str) -> None:
     subprocess.run(
-        ["docker", "rm", "-f", QDRANT_BQ_NAME],
+        ["docker", "rm", "-f", name],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -438,7 +646,7 @@ class OspreyHttpEngine:
         self.load_time_s = 0.0
 
     def start(self) -> float:
-        cmd = [
+        base_cmd = [
             self.runner_bin,
             "serve",
             "--osi",
@@ -450,6 +658,20 @@ class OspreyHttpEngine:
             "--cache-mb",
             str(self.cache_mb),
         ]
+        if has_systemd_user_scope():
+            unit = f"osprey-serve-{os.getpid()}-{int(time.time() * 1000)}"
+            cmd = [
+                "systemd-run",
+                "--user",
+                "--scope",
+                "--quiet",
+                f"--unit={unit}",
+                "-p",
+                "MemoryAccounting=yes",
+                *base_cmd,
+            ]
+        else:
+            cmd = base_cmd
         started = time.perf_counter()
         self.proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
@@ -478,6 +700,9 @@ class OspreyHttpEngine:
 
     def vmhwm_kb(self) -> int:
         return read_vmhwm_kb(self.proc.pid) if self.proc is not None else 0
+
+    def cgroup_peak_kb(self) -> int:
+        return read_pid_cgroup_peak_kb(self.proc.pid) if self.proc is not None else 0
 
     def _payload(
         self, query: np.ndarray, nprobe: int, refine_m: int, top_k: int, refine_multiplier: int
@@ -631,10 +856,20 @@ class OspreyHttpEngine:
         server_ms = [r[2] for r in results if r is not None]
         return ids, client_ms, server_ms, wall_s
 
+    def sequential_prepared(
+        self, payloads: Sequence[bytes]
+    ) -> Tuple[List[List[int]], List[float], List[float]]:
+        ids, client_ms, server_ms, _wall = run_rust_http_load(
+            self.runner_bin, f"{self.base_url}/search", "osprey", payloads, 1
+        )
+        return ids, client_ms, server_ms
+
     def concurrent_prepared(
         self, payloads: Sequence[bytes], workers: int = 16
     ) -> Tuple[List[List[int]], List[float], List[float], float]:
-        return asyncio.run(self._concurrent_payloads(payloads, workers))
+        return run_rust_http_load(
+            self.runner_bin, f"{self.base_url}/search", "osprey", payloads, workers
+        )
 
     def concurrent(
         self,
@@ -656,11 +891,19 @@ class OspreyHttpEngine:
 # Qdrant engine (REST for queries, client for setup)
 # ---------------------------------------------------------------------------
 class QdrantEngine:
-    def __init__(self, url: str, container: str, data_dir: Path, dataset: str):
+    def __init__(
+        self,
+        url: str,
+        container: str,
+        data_dir: Path,
+        dataset: str,
+        runner_bin: str = "",
+    ):
         self.url = url.rstrip("/")
         self.container = container
         self.data_dir = data_dir
         self.dataset = dataset
+        self.runner_bin = runner_bin
         self.client = httpx.Client(timeout=120.0)
         self.current_coll = ""
 
@@ -673,9 +916,12 @@ class QdrantEngine:
     def collection(self, variant: str) -> str:
         return f"ctrl_{self.dataset}_{variant}"
 
-    def _wait_ready(self, client: QdrantClient, coll: str, expected: int) -> None:
+    def _wait_ready(
+        self, client: QdrantClient, coll: str, expected: int, allow_grey: bool = False
+    ) -> None:
         deadline = time.time() + 900
         last = ""
+        ok_statuses = ("green", "grey") if allow_grey else ("green",)
         while time.time() < deadline:
             info = client.get_collection(coll)
             count = client.count(coll, exact=True).count
@@ -684,7 +930,7 @@ class QdrantEngine:
             last = f"status={info.status} optimizer={info.optimizer_status} count={count}/{expected}"
             if (
                 count == expected
-                and st.endswith("green")
+                and st.endswith(ok_statuses)
                 and "in_progress" not in opt
                 and "indexing" not in opt
                 and "optimizing" not in opt
@@ -698,7 +944,7 @@ class QdrantEngine:
         base: np.ndarray,
         dim: int,
         variant: str,
-        bq: bool,
+        quantization: Optional[str] = None,
     ) -> Tuple[float, str]:
         client = QdrantClient(url=self.url, timeout=900)
         coll = self.collection(variant)
@@ -712,9 +958,15 @@ class QdrantEngine:
         except Exception:
             pass
         kwargs: Dict[str, Any] = {}
-        if bq:
+        if quantization == "bq":
             kwargs["quantization_config"] = BinaryQuantization(
                 binary=BinaryQuantizationConfig(always_ram=True)
+            )
+        elif quantization == "sq8":
+            kwargs["quantization_config"] = ScalarQuantization(
+                scalar=ScalarQuantizationConfig(
+                    type=ScalarType.INT8, always_ram=True
+                )
             )
         client.create_collection(
             collection_name=coll,
@@ -743,6 +995,17 @@ class QdrantEngine:
             pass
         self.current_coll = coll
         return build_s, coll
+
+    def wait_after_restart(self, coll: str, expected: int) -> None:
+        self.current_coll = coll
+        client = QdrantClient(url=self.url, timeout=900)
+        try:
+            self._wait_ready(client, coll, expected, allow_grey=True)
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
 
     def prepare(self, query: np.ndarray, cfg: Dict[str, Any]) -> bytes:
         params: Dict[str, Any] = {"hnsw_ef": int(cfg["hnsw_ef"])}
@@ -904,9 +1167,39 @@ class QdrantEngine:
         server_ms = [r[2] for r in results if r is not None]
         return ids, client_ms, server_ms, wall_s
 
+    def sequential_prepared(
+        self, payloads: Sequence[bytes]
+    ) -> Tuple[List[List[int]], List[float], List[float]]:
+        if self.runner_bin:
+            ids, client_ms, server_ms, _wall = run_rust_http_load(
+                self.runner_bin,
+                f"{self.url}/collections/{self.current_coll}/points/query",
+                "qdrant",
+                payloads,
+                1,
+            )
+            return ids, client_ms, server_ms
+        ids_out: List[List[int]] = []
+        cms_out: List[float] = []
+        sms_out: List[float] = []
+        for p in payloads:
+            ids, cms, sms = self.query_prepared(p)
+            ids_out.append(ids)
+            cms_out.append(cms)
+            sms_out.append(sms)
+        return ids_out, cms_out, sms_out
+
     def concurrent_prepared(
         self, payloads: Sequence[bytes], workers: int = 16
     ) -> Tuple[List[List[int]], List[float], List[float], float]:
+        if self.runner_bin:
+            return run_rust_http_load(
+                self.runner_bin,
+                f"{self.url}/collections/{self.current_coll}/points/query",
+                "qdrant",
+                payloads,
+                workers,
+            )
         return asyncio.run(self._concurrent_payloads(payloads, workers))
 
     def concurrent(
@@ -929,10 +1222,21 @@ class QdrantEngine:
 # pgvector engine
 # ---------------------------------------------------------------------------
 class PgvectorEngine:
-    def __init__(self, dataset: str, dim: int):
+    def __init__(self, dataset: str, dim: int, variant: str = "pgvector"):
         self.dataset = dataset
         self.dim = dim
-        self.table = f"ctrl_vecs_{dataset}"
+        self.variant = variant
+        self.col_type = "halfvec" if variant == "pgvector_halfvec" else "vector"
+        self.ops_class = (
+            "halfvec_cosine_ops"
+            if variant == "pgvector_halfvec"
+            else "vector_cosine_ops"
+        )
+        self.table = (
+            f"ctrl_vecs_{dataset}"
+            if variant == "pgvector"
+            else f"ctrl_vecs_{dataset}_halfvec"
+        )
         self._ef_by_conn: Dict[int, int] = {}
 
     def vmhwm_kb(self) -> int:
@@ -949,7 +1253,7 @@ class PgvectorEngine:
                 cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
                 cur.execute(f"DROP TABLE IF EXISTS {self.table};")
                 cur.execute(
-                    f"CREATE TABLE {self.table} (id BIGINT PRIMARY KEY, emb vector({self.dim}));"
+                    f"CREATE TABLE {self.table} (id BIGINT PRIMARY KEY, emb {self.col_type}({self.dim}));"
                 )
                 cur.execute("SET maintenance_work_mem = '1GB';")
             with conn.cursor() as cur:
@@ -960,7 +1264,7 @@ class PgvectorEngine:
                         )
                 cur.execute(
                     f"CREATE INDEX {self.table}_hnsw_idx ON {self.table} "
-                    "USING hnsw (emb vector_cosine_ops) WITH (m = 16, ef_construction = 100);"
+                    f"USING hnsw (emb {self.ops_class}) WITH (m = 16, ef_construction = 100);"
                 )
         return time.perf_counter() - started
 
@@ -976,7 +1280,7 @@ class PgvectorEngine:
         self.set_ef(conn, ef)
         started = time.perf_counter()
         cur = conn.execute(
-            f"SELECT id FROM {self.table} ORDER BY emb <=> %s::vector LIMIT 10;",
+            f"SELECT id FROM {self.table} ORDER BY emb <=> %s::{self.col_type} LIMIT 10;",
             (q_literal,),
         )
         rows = cur.fetchall()
@@ -994,29 +1298,35 @@ class PgvectorEngine:
         for idx in range(len(q_literals)):
             queue.put_nowait(idx)
 
-        async def worker() -> None:
+        # Pre-connect all worker sessions before starting wall-clock QPS timing.
+        conns = []
+        for _ in range(workers):
             conn = await psycopg.AsyncConnection.connect(PGVECTOR_DSN)
-            try:
-                await conn.execute(f"SET hnsw.ef_search = {int(ef)}")
-                while True:
-                    try:
-                        idx = queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        return
-                    started = time.perf_counter()
-                    cur = await conn.execute(
-                        f"SELECT id FROM {self.table} ORDER BY emb <=> %s::vector LIMIT 10;",
-                        (q_literals[idx],),
-                    )
-                    rows = await cur.fetchall()
-                    client_ms = (time.perf_counter() - started) * 1000.0
-                    results[idx] = ([int(r[0]) for r in rows], client_ms)
-            finally:
-                await conn.close()
+            await conn.execute(f"SET hnsw.ef_search = {int(ef)}")
+            conns.append(conn)
 
-        started = time.perf_counter()
-        await asyncio.gather(*[worker() for _ in range(workers)])
-        wall_s = time.perf_counter() - started
+        async def worker(conn: psycopg.AsyncConnection) -> None:
+            while True:
+                try:
+                    idx = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                started = time.perf_counter()
+                cur = await conn.execute(
+                    f"SELECT id FROM {self.table} ORDER BY emb <=> %s::{self.col_type} LIMIT 10;",
+                    (q_literals[idx],),
+                )
+                rows = await cur.fetchall()
+                client_ms = (time.perf_counter() - started) * 1000.0
+                results[idx] = ([int(r[0]) for r in rows], client_ms)
+
+        try:
+            started = time.perf_counter()
+            await asyncio.gather(*[worker(c) for c in conns])
+            wall_s = time.perf_counter() - started
+        finally:
+            for c in conns:
+                await c.close()
         ids = [r[0] for r in results if r is not None]
         client_ms = [r[1] for r in results if r is not None]
         return ids, client_ms, [], wall_s
@@ -1035,7 +1345,7 @@ class PgvectorEngine:
             for q_literal in list(q_literals)[:sample]:
                 cur = conn.execute(
                     f"EXPLAIN (ANALYZE, FORMAT JSON) "
-                    f"SELECT id FROM {self.table} ORDER BY emb <=> %s::vector LIMIT 10;",
+                    f"SELECT id FROM {self.table} ORDER BY emb <=> %s::{self.col_type} LIMIT 10;",
                     (q_literal,),
                 )
                 row = cur.fetchone()
@@ -1205,6 +1515,12 @@ def measure_generic(
     prepared_queries: Optional[Sequence[Any]] = None,
     prepare_fn: Optional[Callable[[Any, Dict[str, Any]], Any]] = None,
     server_latency_fn: Optional[Callable[[Dict[str, Any]], Tuple[float, float, float]]] = None,
+    sequential_batch_fn: Optional[
+        Callable[
+            [Sequence[Any], Dict[str, Any]],
+            Tuple[List[List[int]], List[float], List[float]],
+        ]
+    ] = None,
 ) -> Dict[float, Dict[str, Any]]:
     measured: Dict[float, Dict[str, Any]] = {}
     for target, cfg in selected.items():
@@ -1229,16 +1545,19 @@ def measure_generic(
                 f"queries={len(test_items)}",
                 flush=True,
             )
-            ids: List[List[int]] = []
-            latencies: List[float] = []
-            server_latencies: List[float] = []
             source = test_items
-            for item in source:
-                found, client_ms, server_ms = sequential_fn(item, cfg)
-                ids.append(found)
-                latencies.append(client_ms)
-                if server_ms is not None:
-                    server_latencies.append(server_ms)
+            if sequential_batch_fn is not None:
+                ids, latencies, server_latencies = sequential_batch_fn(source, cfg)
+            else:
+                ids = []
+                latencies = []
+                server_latencies = []
+                for item in source:
+                    found, client_ms, server_ms = sequential_fn(item, cfg)
+                    ids.append(found)
+                    latencies.append(client_ms)
+                    if server_ms is not None:
+                        server_latencies.append(server_ms)
             p50, p95, p99 = latency_stats(latencies)
             s50, s95, s99 = latency_stats(server_latencies)
 
@@ -1325,12 +1644,14 @@ def build_row(
     stats: Dict[str, Any],
     load_peak_kb: int,
     query_peak_kb: int,
+    query_vmhwm_kb: int,
     build_peak_kb: int,
     build_time_s: float,
     load_time_s: float,
     disk_mb: float,
     rounds: int,
     workers: int,
+    memory_metric: str,
     notes: str,
 ) -> Dict[str, Any]:
     public_config = {k: v for k, v in config.items() if k not in ("recall", "p50_ms", "status")}
@@ -1386,11 +1707,10 @@ def build_row(
         "qps_concurrent_median": round(float(stats.get("qps_median", 0.0)), 1),
         "qps_concurrent_std": round(float(stats.get("qps_std", 0.0)), 1),
         "concurrent_recall": round(float(stats.get("concurrent_recall_median", 0.0)), 4),
-        "memory_metric": (
-            "VmHWM (process)" if variant == "osprey_http" else "cgroup memory.peak (container)"
-        ),
+        "memory_metric": memory_metric,
         "load_peak_rss_mb": round(load_peak_kb / 1024.0, 1),
         "query_peak_rss_mb": round(query_peak_kb / 1024.0, 1),
+        "process_vmhwm_mb": round(query_vmhwm_kb / 1024.0, 1),
         "build_peak_rss_mb": round(build_peak_kb / 1024.0, 1),
         "build_time_s": round(build_time_s, 3),
         "load_time_s": round(load_time_s, 3),
@@ -1403,6 +1723,290 @@ def build_row(
         "workers": workers,
         "notes": notes,
     }
+
+
+def _run_qdrant_variant(
+    dataset: str,
+    meta: Dict[str, Any],
+    base: np.ndarray,
+    dim: int,
+    splits: Dict[str, Any],
+    targets: Sequence[float],
+    ef_grid: Sequence[int],
+    oversampling_grid: Sequence[float],
+    rounds: int,
+    workers: int,
+    runner_bin: str,
+    variant: str,
+) -> List[Dict[str, Any]]:
+    """Run one Qdrant variant (qdrant_fp32, qdrant_sq8, qdrant_bq) with isolated build vs query cgroups."""
+    stop_all_engines()
+    if variant == "qdrant_fp32":
+        label = "Qdrant (HNSW FP32)"
+        container = QDRANT_FP32_CONTAINER
+        url = QDRANT_FP32_URL
+        data_dir = QDRANT_FP32_DATA
+        quantization: Optional[str] = None
+        short_tag = "fp32"
+        start_qdrant_fp32()
+        restart_fn = restart_qdrant_fp32
+        stop_fn = stop_qdrant_fp32
+        notes = (
+            "Qdrant compose container; HNSW m=16 ef_construct=100; restarted + page cache "
+            "evicted after build; Rust HTTP load client; query peak memory is query-only cgroup memory.peak."
+        )
+    elif variant == "qdrant_sq8":
+        label = "Qdrant (HNSW int8 SQ8 + rescore)"
+        container = QDRANT_SQ8_NAME
+        url = f"http://127.0.0.1:{QDRANT_SQ8_PORT}"
+        data_dir = QDRANT_SQ8_DATA
+        quantization = "sq8"
+        short_tag = "sq8"
+        start_qdrant_dedicated_container(container, QDRANT_SQ8_PORT, data_dir)
+        restart_fn = lambda: restart_qdrant_dedicated_container(container, QDRANT_SQ8_PORT, data_dir)
+        stop_fn = lambda: stop_qdrant_dedicated_container(container)
+        notes = (
+            "Dedicated Qdrant container; scalar quantization INT8 always_ram, rescore=true; "
+            "restarted + page cache evicted after build; Rust HTTP load client; query peak memory is query-only cgroup memory.peak."
+        )
+    elif variant == "qdrant_bq":
+        label = "Qdrant (HNSW 1-bit BQ + rescore)"
+        container = QDRANT_BQ_NAME
+        url = f"http://127.0.0.1:{QDRANT_BQ_PORT}"
+        data_dir = QDRANT_BQ_DATA
+        quantization = "bq"
+        short_tag = "bq"
+        start_qdrant_dedicated_container(container, QDRANT_BQ_PORT, data_dir)
+        restart_fn = lambda: restart_qdrant_dedicated_container(container, QDRANT_BQ_PORT, data_dir)
+        stop_fn = lambda: stop_qdrant_dedicated_container(container)
+        notes = (
+            "Dedicated Qdrant container; binary quantization always_ram, rescore=true; "
+            "restarted + page cache evicted after build; Rust HTTP load client; query peak memory is query-only cgroup memory.peak."
+        )
+    else:
+        raise ValueError(f"unknown Qdrant variant: {variant}")
+
+    print(f"[controlled] {dataset}: starting {label} and building index")
+    eng = QdrantEngine(url, container, data_dir, dataset, runner_bin=runner_bin)
+    try:
+        build_s, coll = eng.setup(base, dim, short_tag, quantization=quantization)
+    finally:
+        build_peak_kb = container_peak_memory_kb(container)
+
+    # Isolate query-stage cgroup memory.peak from build/ingestion spikes.
+    restart_fn()
+    eng.wait_after_restart(coll, len(base))
+    sampler = RssSampler(eng.vmhwm_kb, interval=0.25)
+    sampler.start()
+    load_peak_kb = 0
+    try:
+        print(f"[controlled] {dataset}: calibrating {label}")
+        use_os = quantization is not None
+        calib = calibrate_qdrant(
+            eng,
+            coll,
+            splits["calib"],
+            splits["calib_gt"],
+            ef_grid,
+            oversampling_grid if use_os else [None],
+            use_os,
+        )
+        if use_os:
+            selected = select_for_targets(
+                calib,
+                targets,
+                cost_fn=lambda r: (
+                    r["hnsw_ef"] * float(r["oversampling"] or 1.0),
+                    r["hnsw_ef"],
+                    r["p50_ms"],
+                ),
+            )
+        else:
+            selected = select_for_targets(
+                calib, targets, cost_fn=lambda r: (r["hnsw_ef"], r["p50_ms"])
+            )
+        for target, cfg in selected.items():
+            print(
+                f"  target={target:.3f} -> hnsw_ef={cfg['hnsw_ef']} "
+                f"oversampling={cfg['oversampling']} val_recall={cfg['recall']:.4f} "
+                f"status={cfg['status']}"
+            )
+
+        def seq(item: bytes, cfg: Dict[str, Any]):
+            return eng.query_prepared(item)
+
+        def seq_batch(items: Sequence[bytes], cfg: Dict[str, Any]):
+            return eng.sequential_prepared(items)
+
+        def warm(item: bytes, cfg: Dict[str, Any]):
+            eng.query_prepared(item)
+
+        def conc(items: Sequence[bytes], cfg: Dict[str, Any], nworkers: int):
+            return eng.concurrent_prepared(items, nworkers)
+
+        measured = measure_generic(
+            selected,
+            splits["warmup"],
+            splits["test"],
+            splits["test_gt"],
+            rounds,
+            workers,
+            sequential_fn=seq,
+            warmup_fn=warm,
+            concurrent_fn=conc,
+            prepare_fn=eng.prepare,
+            sequential_batch_fn=seq_batch,
+        )
+    finally:
+        query_vmhwm_kb = sampler.stop()
+        query_peak_kb = container_peak_memory_kb(container)
+    eng.close()
+    stop_fn()
+    disk_mb = eng.disk_mb(coll)
+
+    out_rows: List[Dict[str, Any]] = []
+    for target, stats in measured.items():
+        out_rows.append(
+            build_row(
+                dataset,
+                meta,
+                splits,
+                label,
+                variant,
+                "HTTP localhost (Rust client)",
+                target,
+                selected[target],
+                stats,
+                load_peak_kb,
+                query_peak_kb,
+                query_vmhwm_kb,
+                build_peak_kb,
+                build_s,
+                0.0,
+                disk_mb,
+                rounds,
+                workers,
+                "cgroup v2 memory.peak (query-only)",
+                notes,
+            )
+        )
+    return out_rows
+
+
+def _run_pgvector_variant(
+    dataset: str,
+    meta: Dict[str, Any],
+    base: np.ndarray,
+    dim: int,
+    splits: Dict[str, Any],
+    targets: Sequence[float],
+    ef_grid: Sequence[int],
+    rounds: int,
+    workers: int,
+    variant: str,
+) -> List[Dict[str, Any]]:
+    """Run pgvector FP32 or halfvec (FP16) with isolated build vs query cgroups."""
+    stop_all_engines()
+    label = (
+        "pgvector (HNSW halfvec FP16)"
+        if variant == "pgvector_halfvec"
+        else "pgvector (HNSW FP32)"
+    )
+    print(f"[controlled] {dataset}: starting {label} and building index")
+    start_pgvector()
+    try:
+        clear_pg_tables()
+    except Exception as exc:  # noqa: BLE001 - best-effort cleanup
+        print(f"  [warn] could not clear pgvector tables: {exc}")
+    pg = PgvectorEngine(dataset, dim, variant=variant)
+    try:
+        build_s = pg.setup(base)
+    finally:
+        build_peak_kb = container_peak_memory_kb(PGVECTOR_CONTAINER)
+
+    # Flush WAL/buffers, drop host page cache, and restart into a fresh cgroup.
+    drop_pgvector_page_cache_and_restart()
+    sampler = RssSampler(pg.vmhwm_kb, interval=0.25)
+    sampler.start()
+    load_peak_kb = 0
+    calib_q = [pg.vector_literal(q) for q in splits["calib"]]
+    warm_q = [pg.vector_literal(q) for q in splits["warmup"]]
+    test_q = [pg.vector_literal(q) for q in splits["test"]]
+    try:
+        print(f"[controlled] {dataset}: calibrating {label}")
+        calib = calibrate_pgvector(pg, calib_q, splits["calib_gt"], ef_grid)
+        selected = select_for_targets(
+            calib, targets, cost_fn=lambda r: (r["hnsw_ef_search"], r["p50_ms"])
+        )
+        for target, cfg in selected.items():
+            print(
+                f"  target={target:.3f} -> hnsw.ef_search={cfg['hnsw_ef_search']} "
+                f"val_recall={cfg['recall']:.4f} status={cfg['status']}"
+            )
+
+        with psycopg.connect(PGVECTOR_DSN, autocommit=True) as conn:
+
+            def seq(item: str, cfg: Dict[str, Any]):
+                return pg.query(conn, item, cfg["hnsw_ef_search"])
+
+            def warm(item: str, cfg: Dict[str, Any]):
+                pg.query(conn, item, cfg["hnsw_ef_search"])
+
+            def conc(items: Sequence[str], cfg: Dict[str, Any], nworkers: int):
+                return pg.concurrent(list(items), cfg["hnsw_ef_search"], nworkers)
+
+            measured = measure_generic(
+                selected,
+                warm_q,
+                test_q,
+                splits["test_gt"],
+                rounds,
+                workers,
+                sequential_fn=seq,
+                warmup_fn=warm,
+                concurrent_fn=conc,
+                prepared_queries=test_q,
+                server_latency_fn=lambda cfg: pg.server_latency_sample(
+                    test_q, cfg["hnsw_ef_search"], sample=100
+                ),
+            )
+    finally:
+        query_vmhwm_kb = sampler.stop()
+        query_peak_kb = container_peak_memory_kb(PGVECTOR_CONTAINER)
+    disk_mb = pg.disk_mb()
+    stop_pgvector()
+
+    out_rows: List[Dict[str, Any]] = []
+    for target, stats in measured.items():
+        out_rows.append(
+            build_row(
+                dataset,
+                meta,
+                splits,
+                label,
+                variant,
+                "SQL localhost (psycopg)",
+                target,
+                selected[target],
+                stats,
+                load_peak_kb,
+                query_peak_kb,
+                query_vmhwm_kb,
+                build_peak_kb,
+                build_s,
+                0.0,
+                disk_mb,
+                rounds,
+                workers,
+                "cgroup v2 memory.peak (query-only)",
+                (
+                    f"PostgreSQL container ({pg.col_type}); HNSW m=16 ef_construction=100; "
+                    "restarted + page cache dropped after build; server time via EXPLAIN ANALYZE (sample=100); "
+                    "query peak memory is query-only cgroup memory.peak incl. page cache."
+                ),
+            )
+        )
+    return out_rows
 
 
 # ---------------------------------------------------------------------------
@@ -1501,6 +2105,9 @@ def run_controlled(args: Any) -> int:
                     "--json",
                 ]
             )
+            # Evict build-written .osi/.osv from Linux page cache so the serve cgroup
+            # pays the full OS page-cache cost symmetrically with Docker containers.
+            drop_path_page_cache(art_dir)
             bind = f"127.0.0.1:{args.osprey_port}"
             engine = OspreyHttpEngine(
                 args.runner_bin,
@@ -1511,7 +2118,8 @@ def run_controlled(args: Any) -> int:
             )
             print(f"[controlled] {dataset}: starting OspreyDB HTTP server on {bind}")
             load_s = engine.start()
-            load_peak_kb = engine.vmhwm_kb()
+            load_cgroup_kb = engine.cgroup_peak_kb()
+            load_peak_kb = load_cgroup_kb if load_cgroup_kb > 0 else engine.vmhwm_kb()
             sampler = RssSampler(engine.vmhwm_kb, interval=0.25)
             sampler.start()
             try:
@@ -1544,6 +2152,9 @@ def run_controlled(args: Any) -> int:
                     ids, cms, sms, _meta = engine.query_prepared(item)
                     return ids, cms, sms
 
+                def seq_batch(items: Sequence[bytes], cfg: Dict[str, Any]):
+                    return engine.sequential_prepared(items)
+
                 def warm(item: bytes, cfg: Dict[str, Any]):
                     engine.query_prepared(item)
 
@@ -1563,10 +2174,17 @@ def run_controlled(args: Any) -> int:
                     warmup_fn=warm,
                     concurrent_fn=conc,
                     prepare_fn=engine.prepare,
+                    sequential_batch_fn=seq_batch,
                 )
             finally:
-                query_peak_kb = sampler.stop()
+                query_vmhwm_kb = sampler.stop()
+                query_cgroup_kb = engine.cgroup_peak_kb()
                 engine.stop()
+            use_cgroup = query_cgroup_kb > 0
+            query_peak_kb = query_cgroup_kb if use_cgroup else query_vmhwm_kb
+            mem_metric = (
+                "cgroup v2 memory.peak (query-only)" if use_cgroup else "VmHWM (process)"
+            )
 
             for target, stats in measured.items():
                 rows.append(
@@ -1576,12 +2194,13 @@ def run_controlled(args: Any) -> int:
                         splits,
                         "OspreyDB (HTTP, 1-bit .osi + f16 .osv)",
                         "osprey_http",
-                        "HTTP localhost",
+                        "HTTP localhost (Rust client)",
                         target,
                         selected[target],
                         stats,
                         load_peak_kb,
                         query_peak_kb,
+                        query_vmhwm_kb,
                         int(build_peak_mb * 1024),
                         build_s,
                         load_s,
@@ -1591,264 +2210,47 @@ def run_controlled(args: Any) -> int:
                         / (1024.0 * 1024.0),
                         rounds,
                         workers,
-                        "HTTP server in osprey-bench-runner; client and server share localhost; peak memory is process VmHWM.",
-                    )
-                )
-
-        if "qdrant_fp32" in engines:
-            stop_all_engines()
-            print(f"[controlled] {dataset}: starting Qdrant FP32 and building index")
-            start_qdrant_fp32()
-            fp32 = QdrantEngine(
-                QDRANT_FP32_URL, "osprey-bench-qdrant", ROOT / "docker" / "qdrant-data", dataset
-            )
-            try:
-                build_s, coll = fp32.setup(base, dim, "fp32", bq=False)
-            finally:
-                build_peak_kb = container_peak_memory_kb("osprey-bench-qdrant")
-            load_peak_kb = 0  # the container has no separate load phase
-            try:
-                print(f"[controlled] {dataset}: calibrating Qdrant FP32")
-                calib = calibrate_qdrant(
-                    fp32, coll, splits["calib"], splits["calib_gt"], ef_grid, [None], False
-                )
-                selected = select_for_targets(
-                    calib, targets, cost_fn=lambda r: (r["hnsw_ef"], r["p50_ms"])
-                )
-                for target, cfg in selected.items():
-                    print(
-                        f"  target={target:.3f} -> hnsw_ef={cfg['hnsw_ef']} "
-                        f"val_recall={cfg['recall']:.4f} status={cfg['status']}"
-                    )
-
-                def seq(item: bytes, cfg: Dict[str, Any]):
-                    return fp32.query_prepared(item)
-
-                def warm(item: bytes, cfg: Dict[str, Any]):
-                    fp32.query_prepared(item)
-
-                def conc(
-                    items: Sequence[bytes], cfg: Dict[str, Any], nworkers: int
-                ):
-                    return fp32.concurrent_prepared(items, nworkers)
-
-                measured = measure_generic(
-                    selected,
-                    splits["warmup"],
-                    splits["test"],
-                    splits["test_gt"],
-                    rounds,
-                    workers,
-                    sequential_fn=seq,
-                    warmup_fn=warm,
-                    concurrent_fn=conc,
-                    prepare_fn=fp32.prepare,
-                )
-            finally:
-                query_peak_kb = container_peak_memory_kb("osprey-bench-qdrant")
-            fp32.close()
-            stop_qdrant_fp32()
-            # Read on-disk size after shutdown so background compaction has
-            # settled; sampling before stop overstates the collection size.
-            disk_mb = fp32.disk_mb(coll)
-            for target, stats in measured.items():
-                rows.append(
-                    build_row(
-                        dataset,
-                        meta,
-                        splits,
-                        "Qdrant (HNSW FP32)",
-                        "qdrant_fp32",
-                        "HTTP localhost",
-                        target,
-                        selected[target],
-                        stats,
-                        load_peak_kb,
-                        query_peak_kb,
-                        build_peak_kb,
-                        build_s,
-                        0.0,
-                        disk_mb,
-                        rounds,
-                        workers,
-                        "Qdrant compose container; HNSW m=16 ef_construct=100; no separate load phase; peak memory is cgroup memory.peak.",
-                    )
-                )
-
-        if "qdrant_bq" in engines:
-            stop_all_engines()
-            print(f"[controlled] {dataset}: starting dedicated Qdrant BQ and building index")
-            start_qdrant_bq_container()
-            bq_url = f"http://127.0.0.1:{QDRANT_BQ_PORT}"
-            bq = QdrantEngine(bq_url, QDRANT_BQ_NAME, QDRANT_BQ_DATA, dataset)
-            try:
-                build_s, coll = bq.setup(base, dim, "bq", bq=True)
-            finally:
-                build_peak_kb = container_peak_memory_kb(QDRANT_BQ_NAME)
-            load_peak_kb = 0  # the container has no separate load phase
-            try:
-                print(f"[controlled] {dataset}: calibrating Qdrant BQ")
-                calib = calibrate_qdrant(
-                    bq,
-                    coll,
-                    splits["calib"],
-                    splits["calib_gt"],
-                    ef_grid,
-                    oversampling_grid,
-                    True,
-                )
-                selected = select_for_targets(
-                    calib,
-                    targets,
-                    cost_fn=lambda r: (
-                        r["hnsw_ef"] * float(r["oversampling"] or 1.0),
-                        r["hnsw_ef"],
-                        r["p50_ms"],
-                    ),
-                )
-                for target, cfg in selected.items():
-                    print(
-                        f"  target={target:.3f} -> hnsw_ef={cfg['hnsw_ef']} "
-                        f"oversampling={cfg['oversampling']} val_recall={cfg['recall']:.4f} "
-                        f"status={cfg['status']}"
-                    )
-
-                def seq(item: bytes, cfg: Dict[str, Any]):
-                    return bq.query_prepared(item)
-
-                def warm(item: bytes, cfg: Dict[str, Any]):
-                    bq.query_prepared(item)
-
-                def conc(
-                    items: Sequence[bytes], cfg: Dict[str, Any], nworkers: int
-                ):
-                    return bq.concurrent_prepared(items, nworkers)
-
-                measured = measure_generic(
-                    selected,
-                    splits["warmup"],
-                    splits["test"],
-                    splits["test_gt"],
-                    rounds,
-                    workers,
-                    sequential_fn=seq,
-                    warmup_fn=warm,
-                    concurrent_fn=conc,
-                    prepare_fn=bq.prepare,
-                )
-            finally:
-                query_peak_kb = container_peak_memory_kb(QDRANT_BQ_NAME)
-            bq.close()
-            stop_qdrant_bq_container()
-            disk_mb = bq.disk_mb(coll)
-            for target, stats in measured.items():
-                rows.append(
-                    build_row(
-                        dataset,
-                        meta,
-                        splits,
-                        "Qdrant (HNSW 1-bit BQ + rescore)",
-                        "qdrant_bq",
-                        "HTTP localhost",
-                        target,
-                        selected[target],
-                        stats,
-                        load_peak_kb,
-                        query_peak_kb,
-                        build_peak_kb,
-                        build_s,
-                        0.0,
-                        disk_mb,
-                        rounds,
-                        workers,
-                        "Dedicated Qdrant container; binary quantization always_ram, rescore=true; no separate load phase; peak memory is cgroup memory.peak.",
-                    )
-                )
-
-        if "pgvector" in engines:
-            stop_all_engines()
-            print(f"[controlled] {dataset}: starting pgvector and building index")
-            start_pgvector()
-            try:
-                clear_pg_tables()
-            except Exception as exc:  # noqa: BLE001 - best-effort cleanup
-                print(f"  [warn] could not clear pgvector tables: {exc}")
-            pg = PgvectorEngine(dataset, dim)
-            try:
-                build_s = pg.setup(base)
-            finally:
-                build_peak_kb = container_peak_memory_kb(PGVECTOR_CONTAINER)
-            load_peak_kb = 0  # the container has no separate load phase
-            calib_q = [pg.vector_literal(q) for q in splits["calib"]]
-            warm_q = [pg.vector_literal(q) for q in splits["warmup"]]
-            test_q = [pg.vector_literal(q) for q in splits["test"]]
-            try:
-                print(f"[controlled] {dataset}: calibrating pgvector")
-                calib = calibrate_pgvector(pg, calib_q, splits["calib_gt"], ef_grid)
-                selected = select_for_targets(
-                    calib, targets, cost_fn=lambda r: (r["hnsw_ef_search"], r["p50_ms"])
-                )
-                for target, cfg in selected.items():
-                    print(
-                        f"  target={target:.3f} -> hnsw.ef_search={cfg['hnsw_ef_search']} "
-                        f"val_recall={cfg['recall']:.4f} status={cfg['status']}"
-                    )
-
-                with psycopg.connect(PGVECTOR_DSN, autocommit=True) as conn:
-
-                    def seq(item: str, cfg: Dict[str, Any]):
-                        return pg.query(conn, item, cfg["hnsw_ef_search"])
-
-                    def warm(item: str, cfg: Dict[str, Any]):
-                        pg.query(conn, item, cfg["hnsw_ef_search"])
-
-                    def conc(
-                        items: Sequence[str], cfg: Dict[str, Any], nworkers: int
-                    ):
-                        return pg.concurrent(
-                            list(items), cfg["hnsw_ef_search"], nworkers
-                        )
-
-                    measured = measure_generic(
-                        selected,
-                        warm_q,
-                        test_q,
-                        splits["test_gt"],
-                        rounds,
-                        workers,
-                        sequential_fn=seq,
-                        warmup_fn=warm,
-                        concurrent_fn=conc,
-                        prepared_queries=test_q,
-                        server_latency_fn=lambda cfg: pg.server_latency_sample(
-                            test_q, cfg["hnsw_ef_search"], sample=100
+                        mem_metric,
+                        (
+                            "HTTP server in osprey-bench-runner; Rust HTTP load client; "
+                            ".osi/.osv page cache dropped before serve; peak memory includes RSS + Linux page cache via cgroup v2 memory.peak."
                         ),
                     )
-            finally:
-                query_peak_kb = container_peak_memory_kb(PGVECTOR_CONTAINER)
-            disk_mb = pg.disk_mb()
-            stop_pgvector()
-            for target, stats in measured.items():
-                rows.append(
-                    build_row(
+                )
+
+        for q_variant in ("qdrant_fp32", "qdrant_sq8", "qdrant_bq"):
+            if q_variant in engines:
+                rows.extend(
+                    _run_qdrant_variant(
                         dataset,
                         meta,
+                        base,
+                        dim,
                         splits,
-                        "pgvector (HNSW FP32)",
-                        "pgvector",
-                        "SQL localhost",
-                        target,
-                        selected[target],
-                        stats,
-                        load_peak_kb,
-                        query_peak_kb,
-                        build_peak_kb,
-                        build_s,
-                        0.0,
-                        disk_mb,
+                        targets,
+                        ef_grid,
+                        oversampling_grid,
                         rounds,
                         workers,
-                        "PostgreSQL container; HNSW m=16 ef_construction=100; server time via EXPLAIN ANALYZE (sample=100); no separate load phase; peak memory is cgroup memory.peak incl. page cache.",
+                        args.runner_bin,
+                        q_variant,
+                    )
+                )
+
+        for pg_variant in ("pgvector", "pgvector_halfvec"):
+            if pg_variant in engines:
+                rows.extend(
+                    _run_pgvector_variant(
+                        dataset,
+                        meta,
+                        base,
+                        dim,
+                        splits,
+                        targets,
+                        ef_grid,
+                        rounds,
+                        workers,
+                        pg_variant,
                     )
                 )
 

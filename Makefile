@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 PYTHON ?= $(CURDIR)/.venv/bin/python3
 PIP ?= $(CURDIR)/.venv/bin/pip
-OSPREY_SRC ?= /home/ramos/repositories/ospreydb/ospreydb
+OSPREY_SRC ?= $(abspath $(CURDIR)/../ospreydb)
 OSPREY_BIN ?= $(OSPREY_SRC)/target/release/osprey
 RUNNER_BIN := $(CURDIR)/rust/target/release/osprey-bench-runner
 COMPOSE_FILE := $(CURDIR)/docker/docker-compose.yml
@@ -9,7 +9,7 @@ COMPOSE_FILE := $(CURDIR)/docker/docker-compose.yml
 DATASETS ?= sift1m cohere768d scifact fiqa msmarco
 COMPARE_DATASETS ?= sift1m cohere768d
 LUTRANK_DATASETS ?= scifact fiqa msmarco
-PARETO_DATASET ?= sift1m
+PARETO_DATASET ?= cohere768d
 
 .PHONY: help setup check build-rust datasets minio-up minio-down bench-compare bench-compare-controlled bench-compare-adaptive bench-lutrank bench-pareto bench-pareto-adaptive profile-perf plots bench-all clean
 
@@ -81,7 +81,7 @@ bench-compare-controlled:
 		--controlled \
 		--datasets $(COMPARE_DATASETS) \
 		--recall-target 0.95 0.97 \
-		--engines osprey,qdrant_fp32,qdrant_bq,pgvector \
+		--engines osprey,qdrant_fp32,qdrant_sq8,qdrant_bq,pgvector,pgvector_halfvec \
 		--workers 16 \
 		--warmup-queries 200 \
 		--measure-queries 1000 \

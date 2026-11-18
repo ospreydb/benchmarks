@@ -133,7 +133,7 @@ def bench_osprey_lutrank(
     return {
         "dataset": dataset,
         "engine": f"OspreyDB LUT-Rank ({res['simd_tier']} CPU)",
-        "device": "CPU (AVX-512 vpshufb)",
+        "device": "CPU (AVX-512 vpshufb, 1T)",
         "queries": res["queries_evaluated"],
         "candidates_per_query": res["candidates_per_query"],
         "p50_ms": round(res["p50_ms"], 3),
@@ -214,6 +214,7 @@ def bench_colbert_pytorch(
     tokens_by_doc: Dict[int, np.ndarray],
     cands_list: List[List[int]],
     device_str: str,
+    num_threads: Optional[int] = None,
 ) -> Optional[Dict[str, object]]:
     try:
         import torch
@@ -223,77 +224,92 @@ def bench_colbert_pytorch(
     if device_str == "cuda" and not torch.cuda.is_available():
         return None
 
-    device = torch.device(device_str)
-    dtype = torch.float16 if device_str == "cuda" else torch.float32
-    max_ld = max(v.shape[0] for v in tokens_by_doc.values())
-    doc_tensor_cache: Dict[int, torch.Tensor] = {}
-    for did, arr in tokens_by_doc.items():
-        pad = np.zeros((max_ld, 128), dtype=np.float32)
-        pad[: arr.shape[0]] = arr
-        doc_tensor_cache[did] = torch.from_numpy(pad).to(device=device, dtype=dtype)
+    prev_threads = torch.get_num_threads()
+    if device_str == "cpu" and num_threads is not None:
+        torch.set_num_threads(num_threads)
 
-    latencies_ms = []
-    ndcg_sum = 0.0
-    mrr_sum = 0.0
-    qrel_cnt = 0
+    try:
+        device = torch.device(device_str)
+        dtype = torch.float16 if device_str == "cuda" else torch.float32
+        max_ld = max(v.shape[0] for v in tokens_by_doc.values())
+        doc_tensor_cache: Dict[int, torch.Tensor] = {}
+        for did, arr in tokens_by_doc.items():
+            pad = np.zeros((max_ld, 128), dtype=np.float32)
+            pad[: arr.shape[0]] = arr
+            doc_tensor_cache[did] = torch.from_numpy(pad).to(device=device, dtype=dtype)
 
-    with torch.no_grad():
-        # Warmup CUDA / CPU kernel caches before measurement
-        for q, cands in zip(queries[:3], cands_list[:3]):
-            qt_w = torch.from_numpy(np.asarray(q["tokens"], dtype=np.float32)).to(
-                device=device, dtype=dtype
-            )
-            docs_w = torch.stack([doc_tensor_cache[did] for did in cands], dim=0)
-            _ = torch.einsum("qd,knd->kqn", qt_w, docs_w).max(dim=-1).values.sum(dim=-1)
-        if device_str == "cuda":
-            torch.cuda.synchronize()
+        latencies_ms = []
+        ndcg_sum = 0.0
+        mrr_sum = 0.0
+        qrel_cnt = 0
 
-        scored_all = []
-        wall_t0 = time.perf_counter()
-        for q, cands in zip(queries, cands_list):
-            t0 = time.perf_counter()
-            qt = torch.from_numpy(np.asarray(q["tokens"], dtype=np.float32)).to(
-                device=device, dtype=dtype
-            )
-            batch_docs = torch.stack([doc_tensor_cache[did] for did in cands], dim=0)
-            sims = torch.einsum("qd,knd->kqn", qt, batch_docs)
-            scores = sims.max(dim=-1).values.sum(dim=-1)
+        with torch.no_grad():
+            # Warmup CUDA / CPU kernel caches before measurement
+            for q, cands in zip(queries[:3], cands_list[:3]):
+                qt_w = torch.from_numpy(np.asarray(q["tokens"], dtype=np.float32)).to(
+                    device=device, dtype=dtype
+                )
+                docs_w = torch.stack([doc_tensor_cache[did] for did in cands], dim=0)
+                _ = torch.einsum("qd,knd->kqn", qt_w, docs_w).max(dim=-1).values.sum(dim=-1)
             if device_str == "cuda":
                 torch.cuda.synchronize()
-            score_list = scores.float().cpu().tolist()
-            scored = sorted(zip(cands, score_list), key=lambda x: (-x[1], x[0]))
-            latencies_ms.append((time.perf_counter() - t0) * 1000.0)
-            scored_all.append((q, scored))
-    if device_str == "cuda":
-        torch.cuda.synchronize()
-    wall_s = time.perf_counter() - wall_t0
 
-    for q, scored in scored_all:
-        if q.get("qrels"):
-            qrel_cnt += 1
-            ndcg, mrr = eval_ndcg_mrr([d for d, _ in scored], q["qrels"])
-            ndcg_sum += ndcg
-            mrr_sum += mrr
-    arr = np.sort(np.asarray(latencies_ms))
-    bytes_per_elem = 2 if dtype == torch.float16 else 4
-    raw_mb = sum(v.size * bytes_per_elem for v in tokens_by_doc.values()) / (1024.0 * 1024.0)
-    label = "PyTorch CUDA GPU" if device_str == "cuda" else "PyTorch CPU"
-    return {
-        "dataset": dataset,
-        "engine": f"ColBERTv2 ({label})",
-        "device": device_str.upper(),
-        "queries": len(queries),
-        "candidates_per_query": len(cands_list[0]) if cands_list else 0,
-        "p50_ms": round(float(np.percentile(arr, 50)), 3),
-        "p95_ms": round(float(np.percentile(arr, 95)), 3),
-        "p99_ms": round(float(np.percentile(arr, 99)), 3),
-        "mean_ms": round(float(arr.mean()), 3),
-        "qps": round(len(queries) / max(wall_s, 1e-9), 1),
-        "ndcg_at_10": round(ndcg_sum / max(1, qrel_cnt), 4),
-        "mrr_at_10": round(mrr_sum / max(1, qrel_cnt), 4),
-        "index_mb": round(raw_mb, 2),
-        "lut_synth_us": 0.0,
-    }
+            scored_all = []
+            wall_t0 = time.perf_counter()
+            for q, cands in zip(queries, cands_list):
+                t0 = time.perf_counter()
+                qt = torch.from_numpy(np.asarray(q["tokens"], dtype=np.float32)).to(
+                    device=device, dtype=dtype
+                )
+                batch_docs = torch.stack([doc_tensor_cache[did] for did in cands], dim=0)
+                sims = torch.einsum("qd,knd->kqn", qt, batch_docs)
+                scores = sims.max(dim=-1).values.sum(dim=-1)
+                if device_str == "cuda":
+                    torch.cuda.synchronize()
+                score_list = scores.float().cpu().tolist()
+                scored = sorted(zip(cands, score_list), key=lambda x: (-x[1], x[0]))
+                latencies_ms.append((time.perf_counter() - t0) * 1000.0)
+                scored_all.append((q, scored))
+        if device_str == "cuda":
+            torch.cuda.synchronize()
+        wall_s = time.perf_counter() - wall_t0
+
+        for q, scored in scored_all:
+            if q.get("qrels"):
+                qrel_cnt += 1
+                ndcg, mrr = eval_ndcg_mrr([d for d, _ in scored], q["qrels"])
+                ndcg_sum += ndcg
+                mrr_sum += mrr
+        arr = np.sort(np.asarray(latencies_ms))
+        bytes_per_elem = 2 if dtype == torch.float16 else 4
+        raw_mb = sum(v.size * bytes_per_elem for v in tokens_by_doc.values()) / (1024.0 * 1024.0)
+        if device_str == "cuda":
+            label = "PyTorch CUDA GPU"
+            dev_label = "CUDA (FP16)"
+        elif num_threads == 1:
+            label = "PyTorch CPU 1T"
+            dev_label = "CPU (1T)"
+        else:
+            label = "PyTorch CPU"
+            dev_label = f"CPU ({torch.get_num_threads()}T)"
+        return {
+            "dataset": dataset,
+            "engine": f"ColBERTv2 ({label})",
+            "device": dev_label,
+            "queries": len(queries),
+            "candidates_per_query": len(cands_list[0]) if cands_list else 0,
+            "p50_ms": round(float(np.percentile(arr, 50)), 3),
+            "p95_ms": round(float(np.percentile(arr, 95)), 3),
+            "p99_ms": round(float(np.percentile(arr, 99)), 3),
+            "mean_ms": round(float(arr.mean()), 3),
+            "qps": round(len(queries) / max(wall_s, 1e-9), 1),
+            "ndcg_at_10": round(ndcg_sum / max(1, qrel_cnt), 4),
+            "mrr_at_10": round(mrr_sum / max(1, qrel_cnt), 4),
+            "index_mb": round(raw_mb, 2),
+            "lut_synth_us": 0.0,
+        }
+    finally:
+        torch.set_num_threads(prev_threads)
 
 
 def bench_colbert_onnx(
@@ -435,8 +451,10 @@ def main() -> int:
 
         rows.append(bench_colbert_numpy_cpu(ds, queries, tokens_by_doc, cands_list))
 
-        for dev in ["cpu", "cuda"]:
-            pt_row = bench_colbert_pytorch(ds, queries, tokens_by_doc, cands_list, dev)
+        for dev, n_threads in [("cpu", 1), ("cpu", None), ("cuda", None)]:
+            pt_row = bench_colbert_pytorch(
+                ds, queries, tokens_by_doc, cands_list, dev, num_threads=n_threads
+            )
             if pt_row is not None:
                 rows.append(pt_row)
 

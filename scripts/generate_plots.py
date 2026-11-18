@@ -28,18 +28,29 @@ RESULTS_DIR = ROOT / "results"
 FIG_DIR = RESULTS_DIR / "figures"
 CONTROLLED_CSV = RESULTS_DIR / "compare_engines_controlled.csv"
 
-ENGINE_ORDER = ["OspreyDB", "Qdrant FP32", "Qdrant BQ", "pgvector"]
+ENGINE_ORDER = [
+    "OspreyDB",
+    "Qdrant FP32",
+    "Qdrant SQ8",
+    "Qdrant BQ",
+    "pgvector FP32",
+    "pgvector halfvec",
+]
 ENGINE_COLORS = {
     "OspreyDB": "#0F766E",
     "Qdrant FP32": "#2563EB",
+    "Qdrant SQ8": "#0284C7",
     "Qdrant BQ": "#7C3AED",
-    "pgvector": "#D97706",
+    "pgvector FP32": "#D97706",
+    "pgvector halfvec": "#EA580C",
 }
 ENGINE_MARKERS = {
     "OspreyDB": "o",
     "Qdrant FP32": "s",
+    "Qdrant SQ8": "P",
     "Qdrant BQ": "^",
-    "pgvector": "D",
+    "pgvector FP32": "D",
+    "pgvector halfvec": "X",
 }
 DATASET_LABELS = {
     "sift1m": "SIFT1M",
@@ -75,10 +86,14 @@ def controlled_engine_label(engine: str) -> str:
         return "OspreyDB"
     if engine.startswith("Qdrant (HNSW FP32)"):
         return "Qdrant FP32"
+    if engine.startswith("Qdrant (HNSW int8") or "SQ8" in engine:
+        return "Qdrant SQ8"
     if engine.startswith("Qdrant (HNSW 1-bit"):
         return "Qdrant BQ"
+    if "halfvec" in engine:
+        return "pgvector halfvec"
     if engine.startswith("pgvector"):
-        return "pgvector"
+        return "pgvector FP32"
     return engine
 
 
@@ -139,7 +154,7 @@ def plot_fig1_controlled_memory() -> None:
         )
 
         ax.set_xticks(x)
-        ax.set_xticklabels(engines)
+        ax.set_xticklabels(engines, fontsize=8, rotation=16, ha="right")
         ax.set_ylabel("MiB (log scale)")
         ax.set_yscale("log")
         ax.set_title(f"{DATASET_LABELS.get(ds, ds.upper())} — Peak memory and disk")
@@ -272,7 +287,7 @@ def plot_fig3_controlled_build_time() -> None:
 
     engines_all = sorted(set(controlled_engine_label(r["engine"]) for r in rows), key=ENGINE_ORDER.index)
     ax.set_xticks(np.arange(len(engines_all)))
-    ax.set_xticklabels(engines_all)
+    ax.set_xticklabels(engines_all, fontsize=8.5, rotation=14, ha="right")
     ax.set_ylabel("Index build time (s)")
     ax.set_title("Index build time — controlled run")
     ax.set_ylim(0, max(all_values) * 1.18 if all_values else 1)
@@ -450,7 +465,7 @@ def plot_fig6_lutrank() -> None:
 
     x = np.arange(len(datasets))
     width = 0.72 / max(1, len(engines))
-    colors = ["#0F766E", "#64748B", "#2563EB", "#DC2626"]
+    colors = ["#0F766E", "#64748B", "#0284C7", "#2563EB", "#DC2626", "#D97706"]
 
     for ei, eng in enumerate(engines):
         p50s = []

@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -90,6 +91,20 @@ enum Cmd {
         top_k: usize,
         #[arg(long, default_value_t = 100)]
         max_queries: usize,
+        #[arg(long)]
+        out_json: PathBuf,
+    },
+    /// Executes sequential or concurrent HTTP/1.1 keep-alive POST payloads without Python client overhead.
+    HttpLoad {
+        #[arg(long)]
+        url: String,
+        /// Engine response schema: "osprey" or "qdrant".
+        #[arg(long)]
+        engine: String,
+        #[arg(long)]
+        payloads_file: PathBuf,
+        #[arg(long, default_value_t = 16)]
+        workers: usize,
         #[arg(long)]
         out_json: PathBuf,
     },
@@ -247,6 +262,7 @@ async fn handle_server_search(
 
 #[derive(Debug, Deserialize)]
 struct BeirQuery {
+    #[allow(dead_code)]
     query_id: String,
     tokens: Vec<Vec<f32>>,
     #[serde(default)]
@@ -614,6 +630,26 @@ fn run_search_eval(
             let cache_bytes = cache_mb.saturating_mul(1024 * 1024);
             let cache = MinipageLruCache::new(cache_bytes);
 
+            // Warmup connections/caches without recording into metrics.
+            for wi in 0..3.min(q_count) {
+                let q = &q_flat[wi * q_dim..(wi + 1) * q_dim];
+                let stage1_hits = osi
+                    .search_candidates(q, plan.effective_nprobe, plan.stage1_limit, &simd)
+                    .map_err(|e| e.to_string())?;
+                let _ = rt
+                    .block_on(refine_stage.refine_scored_async(
+                        q,
+                        &stage1_hits,
+                        top_k,
+                        &directory,
+                        &cache,
+                        &store,
+                        &obj_path,
+                        &remote_cfg,
+                    ))
+                    .map_err(|e| e.to_string())?;
+            }
+
             let mut latencies = Vec::with_capacity(q_count);
             let mut s1_sum = 0.0_f64;
             let mut warp_us_sum = 0.0_f64;
@@ -667,7 +703,7 @@ fn run_search_eval(
                         recall_hits += 1;
                     }
                 }
-                recall_denom += gt_k;
+                recall_denom += gt_set.len();
             }
             let total_wall_s = wall_start.elapsed().as_secs_f64();
             latencies.sort_by(f64::total_cmp);
@@ -912,6 +948,202 @@ fn run_lutrank_eval(
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+struct OspreyHttpResp {
+    doc_ids: Vec<u64>,
+    server_ms: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct QdrantPointResp {
+    id: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct QdrantResultResp {
+    points: Vec<QdrantPointResp>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QdrantHttpResp {
+    result: QdrantResultResp,
+    #[serde(default)]
+    time: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct HttpLoadReport {
+    doc_ids: Vec<Vec<u64>>,
+    client_ms: Vec<f64>,
+    server_ms: Vec<f64>,
+    wall_s: f64,
+}
+
+fn parse_http_engine_response(engine: &str, body: &[u8]) -> Result<(Vec<u64>, f64), String> {
+    match engine {
+        "osprey" => {
+            let parsed: OspreyHttpResp =
+                serde_json::from_slice(body).map_err(|e| format!("parse osprey json: {e}"))?;
+            Ok((parsed.doc_ids, parsed.server_ms))
+        }
+        "qdrant" => {
+            let parsed: QdrantHttpResp =
+                serde_json::from_slice(body).map_err(|e| format!("parse qdrant json: {e}"))?;
+            let ids = parsed.result.points.into_iter().map(|p| p.id).collect();
+            Ok((ids, parsed.time * 1000.0))
+        }
+        other => Err(format!(
+            "unsupported --engine '{other}' (expected osprey or qdrant)"
+        )),
+    }
+}
+
+fn run_http_load(
+    url: &str,
+    engine: &str,
+    payloads_file: &Path,
+    workers: usize,
+    out_json: &Path,
+) -> Result<(), String> {
+    if engine != "osprey" && engine != "qdrant" {
+        return Err(format!(
+            "unsupported --engine '{engine}' (expected osprey or qdrant)"
+        ));
+    }
+    let file = File::open(payloads_file).map_err(|e| e.to_string())?;
+    let reader = BufReader::new(file);
+    let mut payloads: Vec<Vec<u8>> = Vec::new();
+    for line in reader.lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            payloads.push(trimmed.as_bytes().to_vec());
+        }
+    }
+    let total = payloads.len();
+    let payloads = Arc::new(payloads);
+    let n_workers = workers.max(1).min(total.max(1));
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let report = rt.block_on(async move {
+        let client = reqwest::Client::builder()
+            .pool_max_idle_per_host(n_workers.max(16))
+            .tcp_nodelay(true)
+            .build()
+            .map_err(|e| e.to_string())?;
+
+        // Warm up persistent TCP keep-alive connections across worker slots before timing.
+        if total > 0 {
+            let mut warm_handles = Vec::with_capacity(n_workers);
+            for wi in 0..n_workers {
+                let c = client.clone();
+                let u = url.to_string();
+                let p = payloads[wi % total].clone();
+                warm_handles.push(tokio::spawn(async move {
+                    let resp = c
+                        .post(&u)
+                        .header("content-type", "application/json")
+                        .body(p)
+                        .send()
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    if !resp.status().is_success() {
+                        return Err(format!("warmup HTTP {}", resp.status()));
+                    }
+                    let _ = resp.bytes().await.map_err(|e| e.to_string())?;
+                    Ok::<(), String>(())
+                }));
+            }
+            for h in warm_handles {
+                h.await.map_err(|e| e.to_string())??;
+            }
+        }
+
+        let results: Arc<tokio::sync::Mutex<Vec<Option<(Vec<u64>, f64, f64)>>>> =
+            Arc::new(tokio::sync::Mutex::new(vec![None; total]));
+        let next_idx = Arc::new(AtomicUsize::new(0));
+        let engine_str = Arc::new(engine.to_string());
+        let url_str = Arc::new(url.to_string());
+
+        let wall_start = Instant::now();
+        let mut handles = Vec::with_capacity(n_workers);
+        for _ in 0..n_workers {
+            let c = client.clone();
+            let u = Arc::clone(&url_str);
+            let eng = Arc::clone(&engine_str);
+            let pl = Arc::clone(&payloads);
+            let idx_gen = Arc::clone(&next_idx);
+            let res_slot = Arc::clone(&results);
+            handles.push(tokio::spawn(async move {
+                let mut local: Vec<(usize, Vec<u64>, f64, f64)> = Vec::new();
+                loop {
+                    let idx = idx_gen.fetch_add(1, Ordering::Relaxed);
+                    if idx >= pl.len() {
+                        break;
+                    }
+                    let t0 = Instant::now();
+                    let resp = c
+                        .post(u.as_str())
+                        .header("content-type", "application/json")
+                        .body(pl[idx].clone())
+                        .send()
+                        .await
+                        .map_err(|e| format!("http request failed: {e}"))?;
+                    if !resp.status().is_success() {
+                        let status = resp.status();
+                        let txt = resp.text().await.unwrap_or_default();
+                        return Err(format!("HTTP {status}: {txt}"));
+                    }
+                    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+                    let client_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    let (ids, server_ms) = parse_http_engine_response(eng.as_str(), &bytes)?;
+                    local.push((idx, ids, client_ms, server_ms));
+                }
+                let mut guard = res_slot.lock().await;
+                for (idx, ids, cms, sms) in local {
+                    guard[idx] = Some((ids, cms, sms));
+                }
+                Ok::<(), String>(())
+            }));
+        }
+        for h in handles {
+            h.await.map_err(|e| e.to_string())??;
+        }
+        let wall_s = wall_start.elapsed().as_secs_f64();
+
+        let guard = results.lock().await;
+        let mut doc_ids = Vec::with_capacity(total);
+        let mut client_ms = Vec::with_capacity(total);
+        let mut server_ms = Vec::with_capacity(total);
+        for item in guard.iter() {
+            let (ids, cms, sms) = item
+                .as_ref()
+                .ok_or_else(|| "missing http-load result slot".to_string())?;
+            doc_ids.push(ids.clone());
+            client_ms.push(*cms);
+            server_ms.push(*sms);
+        }
+
+        Ok::<HttpLoadReport, String>(HttpLoadReport {
+            doc_ids,
+            client_ms,
+            server_ms,
+            wall_s,
+        })
+    })?;
+
+    if let Some(parent) = out_json.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let body = serde_json::to_string(&report).map_err(|e| e.to_string())?;
+    std::fs::write(out_json, body).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn main() -> Result<(), String> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -968,5 +1200,12 @@ fn main() -> Result<(), String> {
             max_queries,
             &out_json,
         ),
+        Cmd::HttpLoad {
+            url,
+            engine,
+            payloads_file,
+            workers,
+            out_json,
+        } => run_http_load(&url, &engine, &payloads_file, workers, &out_json),
     }
 }
