@@ -859,8 +859,10 @@ fn run_lutrank_eval(
         }
     }
 
+    type ScoredWithQrels<'a> = (Vec<(u64, f32)>, &'a HashMap<String, i64>);
+
     let mut latencies_ms = Vec::with_capacity(q_count);
-    let mut all_scored: Vec<(Vec<(u64, f32)>, &HashMap<String, i64>)> = Vec::with_capacity(q_count);
+    let mut all_scored: Vec<ScoredWithQrels<'_>> = Vec::with_capacity(q_count);
 
     let wall_start = Instant::now();
     for pq in &prepared {
@@ -1063,8 +1065,10 @@ fn run_http_load(
             }
         }
 
-        let results: Arc<tokio::sync::Mutex<Vec<Option<(Vec<u64>, f64, f64)>>>> =
-            Arc::new(tokio::sync::Mutex::new(vec![None; total]));
+        type HttpQueryResult = (Vec<u64>, f64, f64);
+        type HttpResultsBuffer = Arc<tokio::sync::Mutex<Vec<Option<HttpQueryResult>>>>;
+
+        let results: HttpResultsBuffer = Arc::new(tokio::sync::Mutex::new(vec![None; total]));
         let next_idx = Arc::new(AtomicUsize::new(0));
         let engine_str = Arc::new(engine.to_string());
         let url_str = Arc::new(url.to_string());

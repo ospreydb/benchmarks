@@ -38,6 +38,7 @@ setup:
 
 check:
 	$(PYTHON) -m compileall -q $(CURDIR)/scripts
+	$(PYTHON) $(CURDIR)/scripts/verify_results.py
 	cargo fmt --manifest-path $(CURDIR)/rust/Cargo.toml --all -- --check
 	docker compose -f $(COMPOSE_FILE) config -q
 

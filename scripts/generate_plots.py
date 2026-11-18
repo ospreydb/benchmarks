@@ -33,6 +33,7 @@ ENGINE_ORDER = [
     "Qdrant FP32",
     "Qdrant SQ8",
     "Qdrant BQ",
+    "FAISS IVF",
     "pgvector FP32",
     "pgvector halfvec",
 ]
@@ -41,6 +42,7 @@ ENGINE_COLORS = {
     "Qdrant FP32": "#2563EB",
     "Qdrant SQ8": "#0284C7",
     "Qdrant BQ": "#7C3AED",
+    "FAISS IVF": "#64748B",
     "pgvector FP32": "#D97706",
     "pgvector halfvec": "#EA580C",
 }
@@ -49,6 +51,7 @@ ENGINE_MARKERS = {
     "Qdrant FP32": "s",
     "Qdrant SQ8": "P",
     "Qdrant BQ": "^",
+    "FAISS IVF": "v",
     "pgvector FP32": "D",
     "pgvector halfvec": "X",
 }
@@ -90,6 +93,8 @@ def controlled_engine_label(engine: str) -> str:
         return "Qdrant SQ8"
     if engine.startswith("Qdrant (HNSW 1-bit"):
         return "Qdrant BQ"
+    if "faiss" in engine.lower():
+        return "FAISS IVF"
     if "halfvec" in engine:
         return "pgvector halfvec"
     if engine.startswith("pgvector"):
@@ -119,9 +124,11 @@ def plot_fig1_controlled_memory() -> None:
         return
 
     datasets = controlled_datasets(rows)
-    fig, axes = plt.subplots(
-        1, max(1, len(datasets)), figsize=(6.6 * max(1, len(datasets)), 4.6), squeeze=False
+    max_engines = max(
+        (len(controlled_rows_by_dataset(rows, ds)) for ds in datasets), default=4
     )
+    fig_w = max(6.8, 1.2 * max_engines) * max(1, len(datasets))
+    fig, axes = plt.subplots(1, max(1, len(datasets)), figsize=(fig_w, 4.9), squeeze=False)
 
     for idx, ds in enumerate(datasets):
         ax = axes[0, idx]
@@ -154,30 +161,33 @@ def plot_fig1_controlled_memory() -> None:
         )
 
         ax.set_xticks(x)
-        ax.set_xticklabels(engines, fontsize=8, rotation=16, ha="right")
+        ax.set_xticklabels(engines, fontsize=8.5, rotation=20, ha="right")
         ax.set_ylabel("MiB (log scale)")
         ax.set_yscale("log")
+        all_vals = mem_vals + disk_vals
+        if all_vals:
+            ax.set_ylim(max(1.0, min(all_vals) * 0.5), max(all_vals) * 2.4)
         ax.set_title(f"{DATASET_LABELS.get(ds, ds.upper())} — Peak memory and disk")
-        ax.legend(frameon=True, fontsize=8.5)
+        ax.legend(frameon=True, fontsize=8.5, loc="upper left")
 
         for bar, value in zip(mem_bars, mem_vals):
             ax.text(
                 bar.get_x() + bar.get_width() / 2.0,
-                value * 1.12,
+                value * 1.10,
                 f"{value:.0f}",
                 ha="center",
                 va="bottom",
-                fontsize=8,
+                fontsize=7.2,
                 fontweight="bold",
             )
         for bar, value in zip(disk_bars, disk_vals):
             ax.text(
                 bar.get_x() + bar.get_width() / 2.0,
-                value * 1.12,
+                value * 1.10,
                 f"{value:.0f}",
                 ha="center",
                 va="bottom",
-                fontsize=8,
+                fontsize=7.2,
             )
 
     fig.tight_layout()
@@ -254,22 +264,26 @@ def plot_fig3_controlled_build_time() -> None:
         return
 
     datasets = controlled_datasets(rows)
-    fig, ax = plt.subplots(figsize=(7.4, 4.6))
-    width = 0.8 / max(1, len(datasets))
+    engines_all = sorted(
+        set(controlled_engine_label(r["engine"]) for r in rows),
+        key=lambda e: ENGINE_ORDER.index(e) if e in ENGINE_ORDER else len(ENGINE_ORDER),
+    )
+    fig, ax = plt.subplots(figsize=(max(7.8, 1.35 * len(engines_all)), 4.9))
+    width = 0.78 / max(1, len(datasets))
     all_values: List[float] = []
 
     for di, ds in enumerate(datasets):
         grouped = controlled_rows_by_dataset(rows, ds)
-        engines = [e for e in ENGINE_ORDER if e in grouped]
+        engines = [e for e in engines_all if e in grouped]
         values = [float(grouped[e]["build_time_s"]) for e in engines]
         all_values.extend(values)
         offset = (di - (len(datasets) - 1) / 2.0) * width
-        x = np.arange(len(engines)) + offset
+        x = np.array([engines_all.index(e) for e in engines], dtype=float) + offset
         bars = ax.bar(
             x,
             values,
-            width=width * 0.9,
-            color=[ENGINE_COLORS[e] for e in engines],
+            width=width * 0.88,
+            color=[ENGINE_COLORS.get(e, "#64748B") for e in engines],
             edgecolor="#0F172A",
             linewidth=0.7,
             alpha=0.75 if di else 1.0,
@@ -278,19 +292,19 @@ def plot_fig3_controlled_build_time() -> None:
         for bar, value in zip(bars, values):
             ax.text(
                 bar.get_x() + bar.get_width() / 2.0,
-                value * 1.02,
+                value + max(all_values) * 0.015,
                 f"{value:.1f}s",
                 ha="center",
                 va="bottom",
-                fontsize=8,
+                fontsize=7.2,
+                rotation=35 if len(engines_all) >= 5 else 0,
             )
 
-    engines_all = sorted(set(controlled_engine_label(r["engine"]) for r in rows), key=ENGINE_ORDER.index)
     ax.set_xticks(np.arange(len(engines_all)))
-    ax.set_xticklabels(engines_all, fontsize=8.5, rotation=14, ha="right")
+    ax.set_xticklabels(engines_all, fontsize=8.5, rotation=16, ha="right")
     ax.set_ylabel("Index build time (s)")
     ax.set_title("Index build time — controlled run")
-    ax.set_ylim(0, max(all_values) * 1.18 if all_values else 1)
+    ax.set_ylim(0, max(all_values) * 1.24 if all_values else 1)
     dataset_handles = [
         Patch(facecolor="#475569", alpha=1.0 if i == 0 else 0.55, label=DATASET_LABELS.get(ds, ds.upper()))
         for i, ds in enumerate(datasets)
@@ -310,8 +324,14 @@ def plot_fig4_controlled_recall_targets() -> None:
         return
 
     datasets = controlled_datasets(rows)
+    max_records = max(
+        (len([r for r in rows if r["dataset"] == ds]) for ds in datasets), default=8
+    )
     fig, axes = plt.subplots(
-        1, max(1, len(datasets)), figsize=(7.0 * max(1, len(datasets)), 4.8), squeeze=False
+        1,
+        max(1, len(datasets)),
+        figsize=(max(7.2, 0.78 * max_records) * max(1, len(datasets)), 5.3),
+        squeeze=False,
     )
 
     for idx, ds in enumerate(datasets):
@@ -325,7 +345,7 @@ def plot_fig4_controlled_recall_targets() -> None:
                 key=lambda r: float(r["recall_target"]),
             ):
                 records.append(row)
-                labels.append(f"{engine}\n{float(row['recall_target']):.2f}")
+                labels.append(f"{engine} ({float(row['recall_target']):.2f})")
 
         x = np.arange(len(records))
         width = 0.36
@@ -356,34 +376,34 @@ def plot_fig4_controlled_recall_targets() -> None:
         for bar, value in zip(val_bars, val_vals):
             ax.text(
                 bar.get_x() + bar.get_width() / 2.0,
-                value + 0.006,
+                value + 0.012,
                 f"{value:.3f}",
                 ha="center",
                 va="bottom",
-                fontsize=6.8,
+                fontsize=6.6,
                 rotation=90,
             )
         for bar, value in zip(test_bars, test_vals):
             ax.text(
                 bar.get_x() + bar.get_width() / 2.0,
-                value + 0.006,
+                value + 0.012,
                 f"{value:.3f}",
                 ha="center",
                 va="bottom",
-                fontsize=6.8,
+                fontsize=6.6,
                 rotation=90,
             )
 
         ax.set_xticks(x)
-        ax.set_xticklabels(labels, fontsize=7)
+        ax.set_xticklabels(labels, fontsize=7.5, rotation=32, ha="right")
         ax.set_ylabel("Recall@10")
-        ax.set_ylim(0, 1.08)
+        ax.set_ylim(0, 1.14)
         ax.set_title(f"{DATASET_LABELS.get(ds, ds.upper())} — Validation vs test recall")
         ax.legend(
             frameon=True,
             fontsize=8,
             loc="upper center",
-            bbox_to_anchor=(0.5, -0.34),
+            bbox_to_anchor=(0.5, -0.28),
             ncol=2,
         )
 
@@ -404,6 +424,14 @@ def plot_fig5_coalesced_s3() -> None:
     if not coalesce_on or not coalesce_off:
         return
 
+    ds_name = rows[0].get("dataset", "cohere768d")
+    ds_label = DATASET_LABELS.get(ds_name, ds_name.upper())
+    rtt_ms = float(rows[0].get("minio_netem_rtt_ms") or 15.0)
+    max_sweep_factor = max(
+        float(r.get("coalesce_factor") or (float(r["avg_raw_pages"]) / max(float(r["avg_s3_gets"]), 1e-6)))
+        for r in coalesce_on
+    )
+
     # Match (nprobe, refine_m) pairs present in both ON and OFF
     off_map = {(int(r["nprobe"]), int(r["refine_m"])): r for r in coalesce_off}
     pairs = []
@@ -418,8 +446,12 @@ def plot_fig5_coalesced_s3() -> None:
     gets_off = [float(off["avg_s3_gets"]) for _, _, off in pairs]
     lat_on = [float(on["p50_ms"]) for _, on, _ in pairs]
     lat_off = [float(off["p50_ms"]) for _, _, off in pairs]
+    max_pair_factor = max(
+        (off_v / max(on_v, 1e-6) for off_v, on_v in zip(gets_off, gets_on)),
+        default=max_sweep_factor,
+    )
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11.5, 4.4))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11.8, 4.6))
     x = np.arange(len(labels))
     w = 0.36
 
@@ -428,20 +460,24 @@ def plot_fig5_coalesced_s3() -> None:
     ax1.set_xticks(x)
     ax1.set_xticklabels(labels, fontsize=8)
     ax1.set_ylabel("Mean S3 Range-GETs / Query")
-    ax1.set_title("S3 Request Coalescing Reduction (Up to 16x+)")
-    ax1.legend(frameon=True, fontsize=8.5)
+    ax1.set_ylim(0, max(gets_off + gets_on) * 1.18 if (gets_off or gets_on) else 1.0)
+    ax1.set_title(
+        f"S3 Request Coalescing ({ds_label}: up to {max_pair_factor:.1f}x paired, {max_sweep_factor:.1f}x sweep max)"
+    )
+    ax1.legend(frameon=True, fontsize=8.5, loc="upper left")
 
     for i, (off_v, on_v) in enumerate(zip(gets_off, gets_on)):
         factor = off_v / max(on_v, 1e-6)
         ax1.text(x[i] + w / 2, on_v + max(gets_off) * 0.02, f"{factor:.1f}x", ha="center", va="bottom", fontsize=8, color="#0F766E", fontweight="bold")
 
-    ax2.bar(x - w / 2, lat_off, width=w, label="Coalesce OFF (MinIO tc netem 15ms)", color="#CBD5E1", edgecolor="#0F172A", lw=0.6)
-    ax2.bar(x + w / 2, lat_on, width=w, label="DP Coalescing (MinIO tc netem 15ms)", color="#2563EB", edgecolor="#0F172A", lw=0.6)
+    ax2.bar(x - w / 2, lat_off, width=w, label=f"Coalesce OFF (MinIO tc netem {rtt_ms:.1f}ms)", color="#CBD5E1", edgecolor="#0F172A", lw=0.6)
+    ax2.bar(x + w / 2, lat_on, width=w, label=f"DP Coalescing (MinIO tc netem {rtt_ms:.1f}ms)", color="#2563EB", edgecolor="#0F172A", lw=0.6)
     ax2.set_xticks(x)
     ax2.set_xticklabels(labels, fontsize=8)
     ax2.set_ylabel("P50 End-to-End S3 Latency (ms)")
-    ax2.set_title("S3 Tail & P50 Latency Under tc netem (15ms RTT)")
-    ax2.legend(frameon=True, fontsize=8.5)
+    ax2.set_ylim(0, max(lat_off + lat_on) * 1.18 if (lat_off or lat_on) else 1.0)
+    ax2.set_title(f"S3 P50 Latency Under tc netem ({rtt_ms:.1f}ms RTT, {ds_label})")
+    ax2.legend(frameon=True, fontsize=8.5, loc="upper left")
 
     fig.tight_layout()
     out = FIG_DIR / "fig5_coalesced_s3_requests_16x.svg"
@@ -508,7 +544,10 @@ def plot_fig7_pareto() -> None:
     if not coalesce_on:
         return
 
-    fig, ax = plt.subplots(figsize=(8.0, 5.2))
+    ds_name = rows[0].get("dataset", "cohere768d")
+    ds_label = DATASET_LABELS.get(ds_name, ds_name.upper())
+
+    fig, ax = plt.subplots(figsize=(8.6, 5.4))
     nprobes = sorted(set(int(r["nprobe"]) for r in coalesce_on))
     cmap = plt.get_cmap("viridis")
 
@@ -534,7 +573,7 @@ def plot_fig7_pareto() -> None:
             zorder=2,
         )
         for x_v, y_v, g_v, r in zip(lats, recs, gets, pts):
-            all_pts.append((np_val, int(r["refine_m"]), x_v, y_v, g_v, color))
+            all_pts.append((np_val, int(r["refine_m"]), x_v, y_v, g_v, color, r))
 
     # Compute Pareto-optimal frontier (minimize P50 latency, maximize Recall@10)
     pareto = []
@@ -556,7 +595,7 @@ def plot_fig7_pareto() -> None:
         label="Pareto frontier",
         zorder=4,
     )
-    for np_val, m_val, x_v, y_v, g_v, color in pareto:
+    for np_val, m_val, x_v, y_v, g_v, color, _ in pareto:
         ax.scatter(
             [x_v],
             [y_v],
@@ -567,40 +606,85 @@ def plot_fig7_pareto() -> None:
             zorder=5,
         )
 
-    # Custom non-overlapping offsets (in points) for Pareto-optimal points.
-    # Omit redundant ultra-close label on (24, 150) which sits 0.3ms from (48, 100).
-    offsets = {
-        (4, 150): (16, -2),
-        (8, 300): (16, -4),
-        (16, 200): (10, -18),
-        (32, 100): (-68, 14),
-        (48, 100): (-78, 16),
-        (32, 150): (10, -18),
-        (48, 150): (-72, 14),
-        (48, 300): (10, 8),
-    }
-    for np_val, m_val, x_v, y_v, g_v, _ in pareto:
-        if (np_val, m_val) not in offsets:
+    # Dynamic axis limits covering 100% of coalesce_enabled=True points with margin
+    all_lats = [p[2] for p in all_pts]
+    all_recs = [p[3] for p in all_pts]
+    x_min, x_max = min(all_lats), max(all_lats)
+    y_min, y_max = min(all_recs), max(all_recs)
+    x_span = max(1.0, x_max - x_min)
+    y_span = max(1.0, y_max - y_min)
+    ax.set_xlim(x_min - x_span * 0.12, x_max + x_span * 0.16)
+    ax.set_ylim(max(0.0, y_min - y_span * 0.18), min(101.0, y_max + y_span * 0.12))
+
+    # Automatically place non-overlapping labels along the Pareto frontier
+    placed_xy: List[tuple] = []
+    candidate_offsets = [
+        (-10, 14),
+        (12, -16),
+        (-74, 14),
+        (14, 10),
+        (-74, -18),
+        (14, -24),
+    ]
+    for idx_p, (np_val, m_val, x_v, y_v, g_v, _, _row) in enumerate(pareto):
+        # Skip labeling if another labeled Pareto point sits virtually on top
+        too_close = any(
+            abs(x_v - px) / x_span < 0.035 and abs(y_v - py) / y_span < 0.035
+            for px, py in placed_xy
+        )
+        if too_close:
             continue
-        dx, dy = offsets[(np_val, m_val)]
+        placed_xy.append((x_v, y_v))
+        # Prefer top-left near upper frontier and right-below near lower frontier
+        dx, dy = candidate_offsets[idx_p % len(candidate_offsets)]
+        if x_v > x_min + 0.72 * x_span:
+            dx = -abs(dx) - 52 if dx > 0 else dx
+        elif x_v < x_min + 0.18 * x_span:
+            dx = abs(dx)
+        if y_v > y_min + 0.82 * y_span and dy > 0:
+            dy = -abs(dy) - 4
         ax.annotate(
             f"{np_val}/{m_val} ({g_v:.1f} GETs)",
             (x_v, y_v),
             textcoords="offset points",
             xytext=(dx, dy),
-            fontsize=7.8,
+            fontsize=7.6,
             color="#0F172A",
             bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="#CBD5E1", alpha=0.92, lw=0.7),
             arrowprops=dict(arrowstyle="-", color="#64748B", lw=0.8),
             zorder=6,
         )
 
-    ax.set_xlim(48, 114)
-    ax.set_ylim(69.5, 99.8)
+    # Dynamic highlight callout from the highest-recall point (>= 0.95 if available, else overall max)
+    high_recall = [r for r in coalesce_on if float(r["recall_at_10"]) >= 0.95]
+    pool = high_recall if high_recall else coalesce_on
+    best_pt = max(pool, key=lambda r: (float(r["recall_at_10"]), -float(r["p50_ms"])))
+    raw_pages = float(best_pt["avg_raw_pages"])
+    s3_gets = float(best_pt["avg_s3_gets"])
+    factor = float(best_pt.get("coalesce_factor") or (raw_pages / max(s3_gets, 1e-6)))
+    best_rec_pct = float(best_pt["recall_at_10"]) * 100.0
+    best_lat = float(best_pt["p50_ms"])
+    ax.text(
+        0.02,
+        0.96,
+        (
+            f"Best Recall@10 ({best_pt['nprobe']}/{best_pt['refine_m']}): "
+            f"{raw_pages:.1f} pages -> {s3_gets:.1f} GETs ({factor:.1f}x coalescing)\n"
+            f"Recall@10 = {best_rec_pct:.1f}% @ {best_lat:.1f} ms"
+        ),
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        fontsize=8.0,
+        color="#0F172A",
+        bbox=dict(boxstyle="round,pad=0.3", fc="#F8FAFC", ec="#94A3B8", alpha=0.95, lw=0.8),
+        zorder=7,
+    )
+
     ax.set_xlabel("P50 Query Latency Over MinIO tc netem (ms)")
     ax.set_ylabel("Recall@10 (%)")
-    ax.set_title("Pareto Frontier: Recall@10 vs Latency vs S3 GETs (Cohere 768d, Coalesce ON)")
-    ax.legend(frameon=True, fontsize=8.5, loc="lower right", ncol=2)
+    ax.set_title(f"Pareto Frontier: Recall@10 vs Latency vs S3 GETs ({ds_label}, Coalesce ON)")
+    ax.legend(frameon=True, fontsize=8.2, loc="lower right", ncol=2)
 
     fig.tight_layout()
     out = FIG_DIR / "fig7_pareto_recall_latency_s3.svg"

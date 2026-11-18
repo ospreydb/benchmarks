@@ -19,7 +19,7 @@ import os
 import sys
 import zipfile
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import h5py
 import numpy as np
@@ -32,8 +32,15 @@ RAW_DIR = ROOT / "datasets" / "raw"
 PREP_DIR = ROOT / "datasets" / "prepared"
 
 URLS = {
-    "sift1m": "http://ann-benchmarks.com/sift-128-euclidean.hdf5",
-    "gist1m": "http://ann-benchmarks.com/gist-960-euclidean.hdf5",
+    "sift1m": [
+        "https://ann-benchmarks.com/sift-128-euclidean.hdf5",
+        "http://ann-benchmarks.com/sift-128-euclidean.hdf5",
+        "https://huggingface.co/datasets/ann-benchmarks/sift-128-euclidean/resolve/main/sift-128-euclidean.hdf5",
+    ],
+    "gist1m": [
+        "https://ann-benchmarks.com/gist-960-euclidean.hdf5",
+        "http://ann-benchmarks.com/gist-960-euclidean.hdf5",
+    ],
     "cohere768d_100k_train": (
         "https://huggingface.co/datasets/makneeee/cohere_small_100k/"
         "resolve/main/parquet/shuffle_train.parquet"
@@ -66,48 +73,57 @@ URLS = {
 }
 
 
-def download_file(url: str, dest: Path, chunk_size: int = 4 * 1024 * 1024) -> Path:
+def download_file(
+    url_or_urls: Union[str, Sequence[str]],
+    dest: Path,
+    chunk_size: int = 4 * 1024 * 1024,
+) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and dest.stat().st_size > 0:
         print(f"[cache] {dest.name} already present ({dest.stat().st_size / 1e6:.2f} MB)")
         return dest
 
+    urls = [url_or_urls] if isinstance(url_or_urls, str) else list(url_or_urls)
     tmp = dest.with_suffix(dest.suffix + ".part")
-    print(f"[download] {url} -> {dest}")
-    for attempt in range(1, 9):
-        existing = tmp.stat().st_size if tmp.exists() else 0
-        headers = {"Range": f"bytes={existing}-"} if existing > 0 else {}
-        try:
-            with requests.get(url, stream=True, timeout=60, headers=headers) as resp:
-                if resp.status_code == 416:
-                    break
-                resp.raise_for_status()
-                is_resume = resp.status_code == 206 and existing > 0
-                mode = "ab" if is_resume else "wb"
-                downloaded = existing if is_resume else 0
-                content_len = int(resp.headers.get("content-length", 0))
-                total = (existing + content_len) if is_resume and content_len > 0 else content_len
-                with open(tmp, mode) as fh:
-                    for chunk in resp.iter_content(chunk_size=chunk_size):
-                        if not chunk:
-                            continue
-                        fh.write(chunk)
-                        downloaded += len(chunk)
-                        if total > 0:
-                            pct = (downloaded / total) * 100.0
-                            print(
-                                f"\r  {downloaded / 1e6:7.1f} / {total / 1e6:7.1f} MB ({pct:5.1f}%)",
-                                end="",
-                                flush=True,
-                            )
-                print()
-                break
-        except (requests.RequestException, TimeoutError) as exc:
-            print(f"\n[retry {attempt}/8] {exc}")
-            if attempt == 8:
-                raise
-    tmp.replace(dest)
-    return dest
+    last_exc: Optional[Exception] = None
+    for url in urls:
+        print(f"[download] {url} -> {dest}")
+        for attempt in range(1, 5):
+            existing = tmp.stat().st_size if tmp.exists() else 0
+            headers = {"Range": f"bytes={existing}-"} if existing > 0 else {}
+            try:
+                with requests.get(url, stream=True, timeout=60, headers=headers) as resp:
+                    if resp.status_code == 416:
+                        break
+                    resp.raise_for_status()
+                    is_resume = resp.status_code == 206 and existing > 0
+                    mode = "ab" if is_resume else "wb"
+                    downloaded = existing if is_resume else 0
+                    content_len = int(resp.headers.get("content-length", 0))
+                    total = (existing + content_len) if is_resume and content_len > 0 else content_len
+                    with open(tmp, mode) as fh:
+                        for chunk in resp.iter_content(chunk_size=chunk_size):
+                            if not chunk:
+                                continue
+                            fh.write(chunk)
+                            downloaded += len(chunk)
+                            if total > 0:
+                                pct = (downloaded / total) * 100.0
+                                print(
+                                    f"\r  {downloaded / 1e6:7.1f} / {total / 1e6:7.1f} MB ({pct:5.1f}%)",
+                                    end="",
+                                    flush=True,
+                                )
+                    print()
+                    tmp.replace(dest)
+                    return dest
+            except (requests.RequestException, TimeoutError) as exc:
+                last_exc = exc
+                print(f"\n[retry {attempt}/4] {url}: {exc}")
+        if tmp.exists():
+            tmp.unlink()
+        print(f"[fallback] primary source failed for {dest.name}, trying next mirror...")
+    raise RuntimeError(f"All download mirrors failed for {dest.name}: {last_exc}")
 
 
 def l2_normalize(mat: np.ndarray) -> np.ndarray:
@@ -136,7 +152,12 @@ def write_parquet_vectors(
     pq.write_table(table, out_path, compression="zstd")
 
 
-def prepare_hdf5_ann(name: str, url: str, max_base: Optional[int], max_queries: int) -> None:
+def prepare_hdf5_ann(
+    name: str,
+    url: Union[str, Sequence[str]],
+    max_base: Optional[int],
+    max_queries: int,
+) -> None:
     raw_file = download_file(url, RAW_DIR / f"{name}.hdf5")
     out_dir = PREP_DIR / name
     out_dir.mkdir(parents=True, exist_ok=True)
