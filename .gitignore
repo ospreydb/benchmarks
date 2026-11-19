@@ -26,6 +26,7 @@ docker/qdrant-data/
 docker/qdrant-bq-data/
 docker/qdrant-sq8-data/
 docker/pgvector-data/
+docker/osprey-data/
 
 # Temporary profiling data
 perf.data

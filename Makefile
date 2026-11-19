@@ -11,7 +11,7 @@ COMPARE_DATASETS ?= sift1m cohere768d
 LUTRANK_DATASETS ?= scifact fiqa msmarco
 PARETO_DATASET ?= cohere768d
 
-.PHONY: help setup check build-rust datasets minio-up minio-down bench-compare bench-compare-controlled bench-compare-adaptive bench-lutrank bench-pareto bench-pareto-adaptive profile-perf plots bench-all clean
+.PHONY: help setup check build-rust datasets minio-up minio-down bench-compare bench-compare-controlled bench-compare-controlled-vldb bench-compare-adaptive bench-lutrank bench-pareto bench-pareto-adaptive profile-perf plots bench-all clean
 
 help:
 	@echo "OspreyDB Reproducible Benchmark Suite"
@@ -23,7 +23,8 @@ help:
 	@echo "  make minio-up       Start MinIO (tc netem 15ms), Qdrant, and pgvector containers"
 	@echo "  make minio-down     Stop benchmark containers"
 	@echo "  make bench-compare  Run OspreyDB vs Qdrant vs pgvector comparison"
-	@echo "  make bench-compare-controlled  Recall-matched controlled run (0.95/0.97, isolated engines)"
+	@echo "  make bench-compare-controlled       Recall-matched controlled run (0.95/0.97, isolated engines)"
+	@echo "  make bench-compare-controlled-vldb  VLDB controlled run (osprey_docker vs Qdrant, pgvector, FAISS)"
 	@echo "  make bench-compare-adaptive  SIFT1M A/B: refine_multiplier 1 (baseline) vs 0 (adaptive)"
 	@echo "  make bench-lutrank  Run LUT-Rank CPU vs ColBERTv2 benchmark"
 	@echo "  make bench-pareto   Run DP range coalescing Pareto sweep over MinIO + tc netem"
@@ -59,14 +60,15 @@ datasets:
 	$(PYTHON) $(CURDIR)/scripts/download_datasets.py --datasets $(DATASETS)
 
 minio-up:
-	mkdir -p $(CURDIR)/docker/minio-data $(CURDIR)/docker/qdrant-data $(CURDIR)/docker/pgvector-data
-	chmod 777 $(CURDIR)/docker/minio-data
+	mkdir -p $(CURDIR)/docker/minio-data $(CURDIR)/docker/qdrant-data $(CURDIR)/docker/pgvector-data $(CURDIR)/docker/osprey-data
+	chmod 777 $(CURDIR)/docker/minio-data $(CURDIR)/docker/osprey-data
 	docker compose -f $(COMPOSE_FILE) up -d --build
 	@sleep 3
 	@docker logs osprey-bench-minio-netem 2>&1 | tail -n 5 || true
 
 minio-down:
-	docker compose -f $(COMPOSE_FILE) down
+	docker compose -f $(COMPOSE_FILE) --profile osprey down --remove-orphans
+	@docker rm -f osprey-bench-osprey 2>/dev/null || true
 
 bench-compare:
 	$(PYTHON) $(CURDIR)/scripts/bench_compare_engines.py \
@@ -83,6 +85,21 @@ bench-compare-controlled:
 		--datasets $(COMPARE_DATASETS) \
 		--recall-target 0.95 0.97 \
 		--engines osprey,qdrant_fp32,qdrant_sq8,qdrant_bq,pgvector,pgvector_halfvec \
+		--workers 16 \
+		--warmup-queries 200 \
+		--measure-queries 1000 \
+		--rounds 3 \
+		--controlled-cache-mb 256 \
+		--osprey-bin $(OSPREY_BIN) \
+		--runner-bin $(RUNNER_BIN) \
+		--out-controlled-csv $(CURDIR)/results/compare_engines_controlled.csv
+
+bench-compare-controlled-vldb:
+	$(PYTHON) $(CURDIR)/scripts/bench_compare_engines.py \
+		--controlled \
+		--datasets $(COMPARE_DATASETS) \
+		--recall-target 0.95 0.97 \
+		--engines osprey_docker,qdrant_fp32,qdrant_sq8,qdrant_bq,pgvector,pgvector_halfvec,faiss_ivf \
 		--workers 16 \
 		--warmup-queries 200 \
 		--measure-queries 1000 \
@@ -138,3 +155,4 @@ bench-all: build-rust datasets minio-up bench-compare bench-compare-controlled b
 
 clean:
 	rm -rf $(CURDIR)/artifacts/*
+	@rm -rf $(CURDIR)/docker/osprey-data/* 2>/dev/null || true

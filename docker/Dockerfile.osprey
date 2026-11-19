@@ -1,0 +1,7 @@
+FROM debian:bookworm-slim
+RUN apt-get update -qq \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /data/store /data/wal
+EXPOSE 6333 8815
+ENTRYPOINT ["/usr/local/bin/osprey"]
