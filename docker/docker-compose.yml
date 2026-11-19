@@ -1,6 +1,7 @@
 services:
   minio:
-    image: cgr.dev/chainguard/minio:latest@sha256:1ec745a06a986762f89e68e355fc189f403941eff8c0a5f94767e92c8e39d3f5
+    image: cgr.dev/chainguard/minio:latest
+    pull_policy: if_not_present
     container_name: osprey-bench-minio
     user: "0:0"
     command: ["server", "/data", "--console-address", ":9001"]
