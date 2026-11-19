@@ -1,0 +1,8 @@
+# Optional neural ColBERTv2 encoding and ML inference baselines (CUDA / CPU).
+# Install with: pip install -r requirements-colbert.txt
+torch>=2.3
+transformers>=4.41
+huggingface-hub>=0.23
+safetensors>=0.4
+onnxruntime>=1.18
+rank-bm25>=0.2.2

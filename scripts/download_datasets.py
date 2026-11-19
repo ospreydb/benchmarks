@@ -16,6 +16,7 @@ import hashlib
 import io
 import json
 import os
+import string
 import sys
 import zipfile
 from pathlib import Path
@@ -236,13 +237,16 @@ def prepare_cohere(scale: str, max_base: Optional[int], max_queries: int) -> Non
 
     chunk = 250
     gt_list = []
+    k_top = min(100, train_norm.shape[0])
     for s in range(0, len(test_norm), chunk):
         sims = test_norm[s : s + chunk] @ train_norm.T
-        k = min(100, train_norm.shape[0] - 1)
-        idx = np.argpartition(-sims, kth=k, axis=1)[:, :100]
-        row_sims = np.take_along_axis(sims, idx, axis=1)
-        order = np.argsort(-row_sims, axis=1)
-        gt_list.append(np.take_along_axis(idx, order, axis=1))
+        if train_norm.shape[0] > k_top:
+            idx = np.argpartition(-sims, kth=k_top - 1, axis=1)[:, :k_top]
+            row_sims = np.take_along_axis(sims, idx, axis=1)
+            order = np.argsort(-row_sims, axis=1)
+            gt_list.append(np.take_along_axis(idx, order, axis=1))
+        else:
+            gt_list.append(np.argsort(-sims, axis=1)[:, :k_top])
     gt = np.vstack(gt_list).astype(np.int64)
 
     doc_ids = np.arange(len(train_norm), dtype=np.uint64)
@@ -266,7 +270,7 @@ def prepare_cohere(scale: str, max_base: Optional[int], max_queries: int) -> Non
 
 
 def hash_token_to_128d(token: str) -> np.ndarray:
-    """Deterministic unit-norm 128-d lexical-semantic projection for a text token."""
+    """Deterministic unit-norm 128-d lexical-semantic projection for a text token (synthetic baseline)."""
     vec = np.zeros(128, dtype=np.float32)
     # Word + character trigram feature hashing into 128d subspace
     grams = [token] + [token[i : i + 3] for i in range(max(0, len(token) - 2))]
@@ -289,12 +293,324 @@ def text_to_colbert_tokens(text: str, max_tokens: int) -> np.ndarray:
     return mat.astype(np.float32)
 
 
+class SyntheticHashEncoder:
+    """Explicit opt-in synthetic BLAKE2b trigram hash encoder (for legacy ablation only)."""
+
+    token_encoder_name = "synthetic-hash"
+
+    def __init__(self, doc_token_cap: int = 128, query_token_cap: int = 32) -> None:
+        self.model_name = "blake2b-trigram-hash"
+        self.doc_token_cap = doc_token_cap
+        self.query_token_cap = query_token_cap
+
+    def encode_docs(self, texts: Sequence[str]) -> List[np.ndarray]:
+        return [text_to_colbert_tokens(t, self.doc_token_cap) for t in texts]
+
+    def encode_queries(self, texts: Sequence[str]) -> List[np.ndarray]:
+        return [text_to_colbert_tokens(t, self.query_token_cap) for t in texts]
+
+
+class ColBERTv2Encoder:
+    """Real neural ColBERTv2 encoder using BERT backbone + 128d linear projection."""
+
+    token_encoder_name = "colbertv2"
+
+    def __init__(
+        self,
+        model_name: str = "colbert-ir/colbertv2.0",
+        doc_token_cap: int = 128,
+        query_token_cap: int = 32,
+        batch_size: int = 64,
+        device: str = "auto",
+    ) -> None:
+        try:
+            import torch
+            import torch.nn as nn
+            import torch.nn.functional as F
+            from huggingface_hub import hf_hub_download
+            from transformers import AutoModel, AutoTokenizer
+        except ImportError as exc:
+            raise RuntimeError(
+                "Real neural ColBERTv2 encoding requires torch, transformers, and huggingface-hub. "
+                "Install with: pip install -r requirements-colbert.txt "
+                "(or pass --token-encoder synthetic-hash for legacy synthetic tokens)."
+            ) from exc
+
+        self._torch = torch
+        self._F = F
+        self.model_name = model_name
+        self.doc_token_cap = doc_token_cap
+        self.query_token_cap = query_token_cap
+        self.batch_size = max(1, batch_size)
+
+        if device == "auto":
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        elif device == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError("--device cuda requested, but CUDA is not available.")
+            self.device = torch.device("cuda")
+        else:
+            self.device = torch.device("cpu")
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.bert = AutoModel.from_pretrained(model_name)
+        linear_weight = self._load_linear_weight(model_name, hf_hub_download)
+        out_dim, in_dim = linear_weight.shape
+        self.linear = nn.Linear(in_dim, out_dim, bias=False)
+        with torch.no_grad():
+            self.linear.weight.copy_(linear_weight)
+
+        self.bert.to(self.device).eval()
+        self.linear.to(self.device).eval()
+
+        # ColBERTv2 uses [unused0] for query marker and [unused1] for doc marker
+        unk_id = self.tokenizer.unk_token_id
+        q_tid = self.tokenizer.convert_tokens_to_ids("[unused0]")
+        d_tid = self.tokenizer.convert_tokens_to_ids("[unused1]")
+        self.q_marker = "[unused0]" if q_tid is not None and q_tid != unk_id else ""
+        self.d_marker = "[unused1]" if d_tid is not None and d_tid != unk_id else ""
+
+        # Skip punctuation and padding tokens in document representations
+        self.skiplist_ids = set()
+        if self.tokenizer.pad_token_id is not None:
+            self.skiplist_ids.add(int(self.tokenizer.pad_token_id))
+        for ch in string.punctuation:
+            tid = self.tokenizer.convert_tokens_to_ids(ch)
+            if tid is not None and tid != unk_id:
+                self.skiplist_ids.add(int(tid))
+
+        print(
+            f"[colbertv2] loaded {model_name} on {self.device} "
+            f"(doc_cap={self.doc_token_cap}, query_cap={self.query_token_cap}, "
+            f"batch_size={self.batch_size}, token_dim={out_dim})"
+        )
+
+    def _load_linear_weight(self, model_name: str, hf_hub_download):
+        torch = self._torch
+        local_dir = Path(model_name)
+        state_dict = None
+
+        if local_dir.is_dir():
+            st_path = local_dir / "model.safetensors"
+            bin_path = local_dir / "pytorch_model.bin"
+            if st_path.exists():
+                from safetensors.torch import load_file
+
+                state_dict = load_file(str(st_path), device="cpu")
+            elif bin_path.exists():
+                state_dict = self._torch_load_cpu(bin_path)
+        else:
+            try:
+                st_file = hf_hub_download(repo_id=model_name, filename="model.safetensors")
+                from safetensors.torch import load_file
+
+                state_dict = load_file(st_file, device="cpu")
+            except Exception:
+                bin_file = hf_hub_download(repo_id=model_name, filename="pytorch_model.bin")
+                state_dict = self._torch_load_cpu(Path(bin_file))
+
+        if state_dict is not None:
+            for key in ("linear.weight", "model.linear.weight", "colbert_linear.weight"):
+                if key in state_dict:
+                    return state_dict[key].float()
+
+        raise RuntimeError(
+            f"Could not find ColBERT 128d projection 'linear.weight' in {model_name}."
+        )
+
+    def _torch_load_cpu(self, path: Path):
+        try:
+            return self._torch.load(str(path), map_location="cpu", weights_only=True)
+        except TypeError:
+            return self._torch.load(str(path), map_location="cpu")
+
+    def _forward_batch(self, input_ids, attention_mask):
+        torch = self._torch
+        F = self._F
+        input_ids = input_ids.to(self.device)
+        attention_mask = attention_mask.to(self.device)
+        use_fp16 = self.device.type == "cuda"
+        with torch.inference_mode():
+            if use_fp16:
+                with torch.amp.autocast("cuda", dtype=torch.float16):
+                    hidden = self.bert(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+                    proj = self.linear(hidden)
+            else:
+                hidden = self.bert(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+                proj = self.linear(hidden)
+            normed = F.normalize(proj.float(), p=2, dim=-1)
+        return normed.cpu().numpy()
+
+    def encode_docs(self, texts: Sequence[str]) -> List[np.ndarray]:
+        out: List[np.ndarray] = []
+        for start in range(0, len(texts), self.batch_size):
+            batch = [f"{self.d_marker} {t}".strip() if self.d_marker else t for t in texts[start : start + self.batch_size]]
+            toks = self.tokenizer(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=self.doc_token_cap,
+                return_tensors="pt",
+            )
+            embs = self._forward_batch(toks["input_ids"], toks["attention_mask"])
+            ids_np = toks["input_ids"].numpy()
+            mask_np = toks["attention_mask"].numpy()
+            for i in range(len(batch)):
+                keep = [
+                    j
+                    for j in range(ids_np.shape[1])
+                    if mask_np[i, j] == 1 and int(ids_np[i, j]) not in self.skiplist_ids
+                ]
+                if not keep:
+                    keep = [j for j in range(ids_np.shape[1]) if mask_np[i, j] == 1][:1] or [0]
+                out.append(embs[i, keep].astype(np.float32))
+        return out
+
+    def encode_queries(self, texts: Sequence[str]) -> List[np.ndarray]:
+        out: List[np.ndarray] = []
+        pad_id = self.tokenizer.pad_token_id
+        mask_id = self.tokenizer.mask_token_id
+        for start in range(0, len(texts), self.batch_size):
+            batch = [f"{self.q_marker} {t}".strip() if self.q_marker else t for t in texts[start : start + self.batch_size]]
+            toks = self.tokenizer(
+                batch,
+                padding="max_length",
+                truncation=True,
+                max_length=self.query_token_cap,
+                return_tensors="pt",
+            )
+            input_ids = toks["input_ids"]
+            attention_mask = toks["attention_mask"]
+            # ColBERTv2 query expansion: replace [PAD] with [MASK] and attend to all tokens
+            if pad_id is not None and mask_id is not None:
+                is_pad = input_ids == pad_id
+                input_ids = input_ids.masked_fill(is_pad, mask_id)
+                attention_mask = attention_mask.masked_fill(is_pad, 1)
+            embs = self._forward_batch(input_ids, attention_mask)
+            for i in range(len(batch)):
+                out.append(embs[i].astype(np.float32))
+        return out
+
+
+TokenEncoder = Union[ColBERTv2Encoder, SyntheticHashEncoder]
+
+
+def build_token_encoder(
+    token_encoder: str,
+    colbert_model: str,
+    doc_token_cap: int,
+    query_token_cap: int,
+    batch_size: int,
+    device: str,
+) -> TokenEncoder:
+    if token_encoder == "synthetic-hash":
+        return SyntheticHashEncoder(doc_token_cap=doc_token_cap, query_token_cap=query_token_cap)
+    return ColBERTv2Encoder(
+        model_name=colbert_model,
+        doc_token_cap=doc_token_cap,
+        query_token_cap=query_token_cap,
+        batch_size=batch_size,
+        device=device,
+    )
+
+
+def _tokens_to_384d_dense(tokens: np.ndarray) -> np.ndarray:
+    """Mean-pool 128d token vectors and project consistently into 384d space."""
+    pooled = tokens.mean(axis=0).astype(np.float32)
+    dense = np.empty(384, dtype=np.float32)
+    dense[:128] = pooled
+    dense[128:256] = np.roll(pooled, 17)
+    dense[256:384] = np.roll(pooled, 43)
+    return dense
+
+
+def _encode_and_write_token_dataset(
+    name: str,
+    docs: List[Tuple[str, str]],
+    queries_map: Dict[str, str],
+    qrels: Dict[str, Dict[str, int]],
+    encoder: TokenEncoder,
+    require_qrels: bool,
+) -> None:
+    out_dir = PREP_DIR / name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    doc_id_map: Dict[str, int] = {orig_id: i for i, (orig_id, _) in enumerate(docs)}
+    doc_texts = [txt for _, txt in docs]
+    print(f"[encode] {name}: encoding {len(doc_texts)} docs with {encoder.token_encoder_name} ({encoder.model_name})...")
+    doc_toks = encoder.encode_docs(doc_texts)
+
+    dense_vecs = np.stack([_tokens_to_384d_dense(t) for t in doc_toks], axis=0) if doc_toks else np.zeros((0, 384), dtype=np.float32)
+    dense_norm = l2_normalize(dense_vecs) if len(dense_vecs) > 0 else dense_vecs
+    doc_ids_u64 = np.arange(len(docs), dtype=np.uint64)
+
+    write_parquet_vectors(out_dir / "base.parquet", doc_ids_u64, dense_norm, texts=doc_texts)
+    with open(out_dir / "corpus_tokens.jsonl", "w", encoding="utf-8") as fh:
+        for i, toks in enumerate(doc_toks):
+            fh.write(
+                json.dumps(
+                    {
+                        "doc_id": i,
+                        "embedding": dense_norm[i].tolist(),
+                        "tokens": toks.tolist(),
+                        "text": doc_texts[i],
+                    }
+                )
+                + "\n"
+            )
+
+    q_items = list(queries_map.items())
+    q_texts = [qt for _, qt in q_items]
+    print(f"[encode] {name}: encoding {len(q_texts)} queries with {encoder.token_encoder_name} ({encoder.model_name})...")
+    q_toks = encoder.encode_queries(q_texts)
+
+    query_records = []
+    for (qid, qtext), qtoks in zip(q_items, q_toks):
+        qdense = _tokens_to_384d_dense(qtoks)
+        qdense /= max(float(np.linalg.norm(qdense)), 1e-8)
+        rel = {
+            str(doc_id_map[d]): s
+            for d, s in qrels.get(qid, {}).items()
+            if d in doc_id_map
+        }
+        if not rel and (require_qrels or qrels):
+            continue
+        query_records.append(
+            {
+                "query_id": qid,
+                "text": qtext,
+                "embedding": qdense.tolist(),
+                "tokens": qtoks.tolist(),
+                "qrels": rel,
+            }
+        )
+
+    with open(out_dir / "queries.json", "w", encoding="utf-8") as fh:
+        json.dump(query_records, fh)
+
+    meta = {
+        "dataset": name,
+        "num_docs": len(docs),
+        "num_queries": len(query_records),
+        "dense_dim": 384,
+        "token_dim": 128,
+        "token_encoder": encoder.token_encoder_name,
+        "model_name": encoder.model_name,
+        "doc_token_cap": encoder.doc_token_cap,
+        "query_token_cap": encoder.query_token_cap,
+    }
+    (out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+    print(
+        f"[prepared] {name}: {meta['num_docs']} docs, {meta['num_queries']} queries "
+        f"(encoder={meta['token_encoder']}, model={meta['model_name']})"
+    )
+
+
 def prepare_beir_dataset(
     name: str,
     max_docs: Optional[int],
     max_queries: int,
-    doc_token_cap: int = 32,
-    query_token_cap: int = 12,
+    encoder: TokenEncoder,
 ) -> None:
     zip_path = download_file(URLS[name], RAW_DIR / f"{name}.zip")
     extract_dir = RAW_DIR / name
@@ -317,7 +633,7 @@ def prepare_beir_dataset(
     qrels: Dict[str, Dict[str, int]] = {}
     if qrel_file is not None:
         with open(qrel_file, "r", encoding="utf-8") as fh:
-            header = fh.readline()
+            _ = fh.readline()
             for line in fh:
                 parts = line.rstrip("\n").split("\t")
                 if len(parts) >= 3:
@@ -366,86 +682,14 @@ def prepare_beir_dataset(
                 docs.append((did, text))
                 seen_ids.add(did)
 
-    out_dir = PREP_DIR / name
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Dense 384d + ColBERT 128d token tensors
-    # Dense vector = normalized mean-pool of 384d projection of text
-    doc_id_map: Dict[str, int] = {}
-    dense_vecs = np.zeros((len(docs), 384), dtype=np.float32)
-    doc_tokens_list: List[List[List[float]]] = []
-    texts_list: List[str] = []
-
-    for i, (orig_id, txt) in enumerate(docs):
-        doc_id_map[orig_id] = i
-        toks_128 = text_to_colbert_tokens(txt, doc_token_cap)
-        doc_tokens_list.append(toks_128.tolist())
-        # Tile/project 128d mean into 384d dense representation
-        pooled = toks_128.mean(axis=0)
-        dense_vecs[i, :128] = pooled
-        dense_vecs[i, 128:256] = np.roll(pooled, 17)
-        dense_vecs[i, 256:384] = np.roll(pooled, 43)
-        texts_list.append(txt[:256])
-
-    dense_norm = l2_normalize(dense_vecs)
-    doc_ids_u64 = np.arange(len(docs), dtype=np.uint64)
-
-    # Write Parquet with doc_id, embedding, text (and tokens JSONL for OspreyDB .osr)
-    write_parquet_vectors(out_dir / "base.parquet", doc_ids_u64, dense_norm, texts=texts_list)
-    with open(out_dir / "corpus_tokens.jsonl", "w", encoding="utf-8") as fh:
-        for i, toks in enumerate(doc_tokens_list):
-            fh.write(
-                json.dumps(
-                    {
-                        "doc_id": i,
-                        "embedding": dense_norm[i].tolist(),
-                        "tokens": toks,
-                        "text": texts_list[i],
-                    }
-                )
-                + "\n"
-            )
-
-    query_records = []
-    for qid, qtext in queries_map.items():
-        qtoks = text_to_colbert_tokens(qtext, query_token_cap)
-        qpooled = qtoks.mean(axis=0)
-        qdense = np.zeros(384, dtype=np.float32)
-        qdense[:128] = qpooled
-        qdense[128:256] = np.roll(qpooled, 17)
-        qdense[256:384] = np.roll(qpooled, 43)
-        qdense /= max(float(np.linalg.norm(qdense)), 1e-8)
-        rel = {
-            str(doc_id_map[d]): s
-            for d, s in qrels.get(qid, {}).items()
-            if d in doc_id_map
-        }
-        if not rel and qrels:
-            continue
-        query_records.append(
-            {
-                "query_id": qid,
-                "text": qtext,
-                "embedding": qdense.tolist(),
-                "tokens": qtoks.tolist(),
-                "qrels": rel,
-            }
-        )
-
-    with open(out_dir / "queries.json", "w", encoding="utf-8") as fh:
-        json.dump(query_records, fh)
-
-    meta = {
-        "dataset": name,
-        "num_docs": len(docs),
-        "num_queries": len(query_records),
-        "dense_dim": 384,
-        "token_dim": 128,
-        "doc_token_cap": doc_token_cap,
-        "query_token_cap": query_token_cap,
-    }
-    (out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
-    print(f"[prepared] {name}: {meta['num_docs']} docs, {meta['num_queries']} queries")
+    _encode_and_write_token_dataset(
+        name=name,
+        docs=docs,
+        queries_map=queries_map,
+        qrels=qrels,
+        encoder=encoder,
+        require_qrels=False,
+    )
 
 
 class _HttpRangeFile(io.RawIOBase):
@@ -488,8 +732,7 @@ class _HttpRangeFile(io.RawIOBase):
 def prepare_msmarco_hf(
     max_docs: int,
     max_queries: int,
-    doc_token_cap: int = 32,
-    query_token_cap: int = 12,
+    encoder: TokenEncoder,
 ) -> None:
     qrels_path = download_file(URLS["msmarco_qrels"], RAW_DIR / "msmarco_dev.tsv")
     queries_pq = download_file(URLS["msmarco_queries"], RAW_DIR / "msmarco_queries.parquet")
@@ -548,76 +791,14 @@ def prepare_msmarco_hf(
         docs.append((did_s, f"{title or ''} {text or ''}".strip()))
         seen.add(did_s)
 
-    out_dir = PREP_DIR / "msmarco"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    doc_id_map: Dict[str, int] = {}
-    dense_vecs = np.zeros((len(docs), 384), dtype=np.float32)
-    doc_tokens_list: List[List[List[float]]] = []
-    texts_list: List[str] = []
-
-    for i, (orig_id, txt) in enumerate(docs):
-        doc_id_map[orig_id] = i
-        toks_128 = text_to_colbert_tokens(txt, doc_token_cap)
-        doc_tokens_list.append(toks_128.tolist())
-        pooled = toks_128.mean(axis=0)
-        dense_vecs[i, :128] = pooled
-        dense_vecs[i, 128:256] = np.roll(pooled, 17)
-        dense_vecs[i, 256:384] = np.roll(pooled, 43)
-        texts_list.append(txt[:256])
-
-    dense_norm = l2_normalize(dense_vecs)
-    doc_ids_u64 = np.arange(len(docs), dtype=np.uint64)
-    write_parquet_vectors(out_dir / "base.parquet", doc_ids_u64, dense_norm, texts=texts_list)
-    with open(out_dir / "corpus_tokens.jsonl", "w", encoding="utf-8") as fh:
-        for i, toks in enumerate(doc_tokens_list):
-            fh.write(
-                json.dumps(
-                    {
-                        "doc_id": i,
-                        "embedding": dense_norm[i].tolist(),
-                        "tokens": toks,
-                        "text": texts_list[i],
-                    }
-                )
-                + "\n"
-            )
-
-    query_records = []
-    for qid, qtext in queries_map.items():
-        qtoks = text_to_colbert_tokens(qtext, query_token_cap)
-        qpooled = qtoks.mean(axis=0)
-        qdense = np.zeros(384, dtype=np.float32)
-        qdense[:128] = qpooled
-        qdense[128:256] = np.roll(qpooled, 17)
-        qdense[256:384] = np.roll(qpooled, 43)
-        qdense /= max(float(np.linalg.norm(qdense)), 1e-8)
-        rel = {str(doc_id_map[d]): s for d, s in qrels.get(qid, {}).items() if d in doc_id_map}
-        if not rel:
-            continue
-        query_records.append(
-            {
-                "query_id": qid,
-                "text": qtext,
-                "embedding": qdense.tolist(),
-                "tokens": qtoks.tolist(),
-                "qrels": rel,
-            }
-        )
-
-    with open(out_dir / "queries.json", "w", encoding="utf-8") as fh:
-        json.dump(query_records, fh)
-
-    meta = {
-        "dataset": "msmarco",
-        "num_docs": len(docs),
-        "num_queries": len(query_records),
-        "dense_dim": 384,
-        "token_dim": 128,
-        "doc_token_cap": doc_token_cap,
-        "query_token_cap": query_token_cap,
-    }
-    (out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
-    print(f"[prepared] msmarco: {meta['num_docs']} docs, {meta['num_queries']} queries")
+    _encode_and_write_token_dataset(
+        name="msmarco",
+        docs=docs,
+        queries_map=queries_map,
+        qrels=qrels,
+        encoder=encoder,
+        require_qrels=True,
+    )
 
 
 def main() -> int:
@@ -631,10 +812,48 @@ def main() -> int:
     parser.add_argument("--sift-limit", type=int, default=1_000_000)
     parser.add_argument("--gist-limit", type=int, default=250_000)
     parser.add_argument("--cohere-scale", choices=["100k", "1m"], default="100k")
-    parser.add_argument("--cohere-limit", type=int, default=100_000)
+    parser.add_argument(
+        "--cohere-limit",
+        type=int,
+        default=None,
+        help="Optional cap on Cohere base vectors (defaults to full 100k or 1m file).",
+    )
     parser.add_argument("--msmarco-limit", type=int, default=50_000)
-    parser.add_argument("--max-queries", type=int, default=500)
+    parser.add_argument("--max-queries", type=int, default=1500)
+    parser.add_argument(
+        "--token-encoder",
+        choices=["colbertv2", "synthetic-hash"],
+        default="colbertv2",
+        help="Token embedding encoder for BEIR/MS MARCO datasets (default: colbertv2).",
+    )
+    parser.add_argument("--colbert-model", default="colbert-ir/colbertv2.0")
+    parser.add_argument(
+        "--doc-token-cap",
+        type=int,
+        default=128,
+        help="Max tokens per document passage (default: 128, configurable up to 180).",
+    )
+    parser.add_argument("--query-token-cap", type=int, default=32)
+    parser.add_argument("--encode-batch-size", type=int, default=64)
+    parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     args = parser.parse_args()
+
+    if args.doc_token_cap < 1 or args.doc_token_cap > 180:
+        parser.error("--doc-token-cap must be between 1 and 180")
+    if args.query_token_cap < 1 or args.query_token_cap > 64:
+        parser.error("--query-token-cap must be between 1 and 64")
+
+    token_datasets = {"scifact", "fiqa", "msmarco"}
+    encoder: Optional[TokenEncoder] = None
+    if any(ds in token_datasets for ds in args.datasets):
+        encoder = build_token_encoder(
+            token_encoder=args.token_encoder,
+            colbert_model=args.colbert_model,
+            doc_token_cap=args.doc_token_cap,
+            query_token_cap=args.query_token_cap,
+            batch_size=args.encode_batch_size,
+            device=args.device,
+        )
 
     for ds in args.datasets:
         if ds == "sift1m":
@@ -644,11 +863,14 @@ def main() -> int:
         elif ds == "cohere768d":
             prepare_cohere(args.cohere_scale, args.cohere_limit, args.max_queries)
         elif ds == "scifact":
-            prepare_beir_dataset("scifact", None, args.max_queries)
+            assert encoder is not None
+            prepare_beir_dataset("scifact", None, args.max_queries, encoder)
         elif ds == "fiqa":
-            prepare_beir_dataset("fiqa", None, args.max_queries)
+            assert encoder is not None
+            prepare_beir_dataset("fiqa", None, args.max_queries, encoder)
         elif ds == "msmarco":
-            prepare_msmarco_hf(args.msmarco_limit, args.max_queries)
+            assert encoder is not None
+            prepare_msmarco_hf(args.msmarco_limit, args.max_queries, encoder)
 
     return 0
 

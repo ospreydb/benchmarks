@@ -9,3 +9,4 @@ httpx>=0.28
 qdrant-client>=1.12
 psycopg[binary]>=3.2
 boto3>=1.35
+rank-bm25>=0.2.2
