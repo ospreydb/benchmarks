@@ -1,5 +1,5 @@
 {
-  "rerank_store": "/home/ramos/orca/workspaces/osprey-benchmarks/artifacts/perf_profile/segment.osr",
+  "rerank_store": "artifacts/perf_profile/segment.osr",
   "simd_tier": "Avx512",
   "query_tokens": 5,
   "token_dim": 128,
