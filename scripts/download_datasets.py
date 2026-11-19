@@ -127,10 +127,16 @@ def download_file(
     raise RuntimeError(f"All download mirrors failed for {dest.name}: {last_exc}")
 
 
-def l2_normalize(mat: np.ndarray) -> np.ndarray:
-    norms = np.linalg.norm(mat, axis=1, keepdims=True)
-    norms = np.maximum(norms, 1e-12)
-    return (mat / norms).astype(np.float32)
+def l2_normalize(mat: np.ndarray, inplace: bool = False) -> np.ndarray:
+    if not inplace:
+        mat = np.array(mat, dtype=np.float32, copy=True)
+    chunk = 50_000
+    for s in range(0, len(mat), chunk):
+        sub = mat[s : s + chunk]
+        norms = np.linalg.norm(sub, axis=1, keepdims=True)
+        np.maximum(norms, 1e-12, out=norms)
+        sub /= norms
+    return mat
 
 
 def write_parquet_vectors(
@@ -138,19 +144,31 @@ def write_parquet_vectors(
     doc_ids: np.ndarray,
     vectors: np.ndarray,
     texts: Optional[List[str]] = None,
+    batch_size: int = 50_000,
 ) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    dim = vectors.shape[1]
-    flat = pa.array(vectors.reshape(-1), type=pa.float32())
-    vec_col = pa.FixedSizeListArray.from_arrays(flat, dim)
-    cols = {
-        "doc_id": pa.array(doc_ids, type=pa.uint64()),
-        "embedding": vec_col,
-    }
+    total, dim = vectors.shape
+    fields = [
+        pa.field("doc_id", pa.uint64()),
+        pa.field("embedding", pa.list_(pa.float32(), dim)),
+    ]
     if texts is not None:
-        cols["text"] = pa.array(texts, type=pa.string())
-    table = pa.table(cols)
-    pq.write_table(table, out_path, compression="zstd")
+        fields.append(pa.field("text", pa.string()))
+    schema = pa.schema(fields)
+
+    with pq.ParquetWriter(out_path, schema, compression="zstd") as writer:
+        for s in range(0, total, batch_size):
+            e = min(total, s + batch_size)
+            sub_vecs = np.ascontiguousarray(vectors[s:e], dtype=np.float32)
+            flat = pa.array(sub_vecs.reshape(-1), type=pa.float32())
+            vec_col = pa.FixedSizeListArray.from_arrays(flat, dim)
+            arrays = [
+                pa.array(doc_ids[s:e], type=pa.uint64()),
+                vec_col,
+            ]
+            if texts is not None:
+                arrays.append(pa.array(texts[s:e], type=pa.string()))
+            writer.write_batch(pa.RecordBatch.from_arrays(arrays, schema=schema))
 
 
 def prepare_hdf5_ann(
@@ -214,6 +232,43 @@ def prepare_hdf5_ann(
     print(f"[prepared] {name}: {meta['num_vectors']} x {meta['dim']}d, {meta['num_queries']} queries")
 
 
+def _load_parquet_embeddings_streaming(
+    pq_path: Path,
+    max_rows: Optional[int],
+    batch_size: int = 50_000,
+) -> np.ndarray:
+    """Stream list<float> embeddings from Parquet into a single contiguous float32 array without Python lists."""
+    pf = pq.ParquetFile(pq_path)
+    col_names = pf.schema_arrow.names
+    emb_col = "emb" if "emb" in col_names else col_names[-1]
+    total_rows = pf.metadata.num_rows
+    if max_rows is not None and max_rows < total_rows:
+        total_rows = max_rows
+
+    out: Optional[np.ndarray] = None
+    cursor = 0
+    for batch in pf.iter_batches(batch_size=batch_size, columns=[emb_col]):
+        if cursor >= total_rows:
+            break
+        take = min(len(batch), total_rows - cursor)
+        col = batch.column(0)
+        if take < len(batch):
+            col = col.slice(0, take)
+        flat = col.flatten().to_numpy(zero_copy_only=False).astype(np.float32, copy=False)
+        dim = len(flat) // take
+        if out is None:
+            out = np.empty((total_rows, dim), dtype=np.float32)
+        chunk = flat.reshape(take, dim)
+        norms = np.linalg.norm(chunk, axis=1, keepdims=True)
+        np.maximum(norms, 1e-12, out=norms)
+        np.divide(chunk, norms, out=out[cursor : cursor + take])
+        cursor += take
+
+    if out is None:
+        return np.empty((0, 0), dtype=np.float32)
+    return out[:cursor]
+
+
 def prepare_cohere(scale: str, max_base: Optional[int], max_queries: int) -> None:
     train_key = f"cohere768d_{scale}_train"
     test_key = f"cohere768d_{scale}_test"
@@ -223,19 +278,10 @@ def prepare_cohere(scale: str, max_base: Optional[int], max_queries: int) -> Non
     out_dir = PREP_DIR / "cohere768d"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    t_train = pq.read_table(train_pq)
-    emb_col = "emb" if "emb" in t_train.column_names else t_train.column_names[-1]
-    train_vecs = np.asarray(t_train[emb_col].to_pylist(), dtype=np.float32)
-    if max_base is not None and max_base < len(train_vecs):
-        train_vecs = train_vecs[:max_base]
-    train_norm = l2_normalize(train_vecs)
+    train_norm = _load_parquet_embeddings_streaming(train_pq, max_base)
+    test_norm = _load_parquet_embeddings_streaming(test_pq, max_queries)
 
-    t_test = pq.read_table(test_pq)
-    q_col = "emb" if "emb" in t_test.column_names else t_test.column_names[-1]
-    test_vecs = np.asarray(t_test[q_col].to_pylist(), dtype=np.float32)[:max_queries]
-    test_norm = l2_normalize(test_vecs)
-
-    chunk = 250
+    chunk = 50
     gt_list = []
     k_top = min(100, train_norm.shape[0])
     for s in range(0, len(test_norm), chunk):
