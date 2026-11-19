@@ -1,7 +1,7 @@
-=== Profiling osprey-engine rerank ===
+=== Profiling osprey rerank ===
 [note] perf hardware PMU events blocked by kernel.perf_event_paranoid=4 (requires <=1 or CAP_PERFMON).
-[fallback] Collecting /usr/bin/time -v OS/CPU counters + osprey-engine JSON telemetry:
-	Command being timed: "/home/ramos/orca/workspaces/osprey/phase-14/target/release/osprey-engine rerank --rerank-store /home/ramos/orca/workspaces/osprey-benchmarks/artifacts/perf_profile/segment.osr --query-tokens /home/ramos/orca/workspaces/osprey-benchmarks/artifacts/perf_profile/query_tokens.json --candidates-file /home/ramos/orca/workspaces/osprey-benchmarks/artifacts/perf_profile/candidates.txt --top-k 10 --json"
+[fallback] Collecting /usr/bin/time -v OS/CPU counters + osprey JSON telemetry:
+	Command being timed: "/home/ramos/orca/workspaces/osprey/phase-14/target/release/osprey rerank --rerank-store /home/ramos/orca/workspaces/osprey-benchmarks/artifacts/perf_profile/segment.osr --query-tokens /home/ramos/orca/workspaces/osprey-benchmarks/artifacts/perf_profile/query_tokens.json --candidates-file /home/ramos/orca/workspaces/osprey-benchmarks/artifacts/perf_profile/candidates.txt --top-k 10 --json"
 	User time (seconds): 0.00
 	System time (seconds): 0.00
 	Percent of CPU this job got: 100%

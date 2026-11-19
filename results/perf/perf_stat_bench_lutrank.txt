@@ -1,7 +1,7 @@
-=== Profiling osprey-engine bench_lutrank ===
+=== Profiling osprey bench_lutrank ===
 [note] perf hardware PMU events blocked by kernel.perf_event_paranoid=4 (requires <=1 or CAP_PERFMON).
-[fallback] Collecting /usr/bin/time -v OS/CPU counters + osprey-engine JSON telemetry:
-	Command being timed: "/home/ramos/orca/workspaces/osprey/phase-14/target/release/osprey-engine bench --vectors 20000 --dim 384 --queries 100 --clusters 128 --nprobe 24 --with-lutrank --json"
+[fallback] Collecting /usr/bin/time -v OS/CPU counters + osprey JSON telemetry:
+	Command being timed: "/home/ramos/orca/workspaces/osprey/phase-14/target/release/osprey bench --vectors 20000 --dim 384 --queries 100 --clusters 128 --nprobe 24 --with-lutrank --json"
 	User time (seconds): 2.15
 	System time (seconds): 1.34
 	Percent of CPU this job got: 371%

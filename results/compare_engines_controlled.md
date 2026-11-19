@@ -107,5 +107,5 @@ Figures: [`fig1_memory_disk_controlled.svg`](figures/fig1_memory_disk_controlled
 ## Reproduction
 
 ```bash
-make bench-compare-controlled OSPREY_SRC=../osprey-engine
+make bench-compare-controlled OSPREY_SRC=../ospreydb
 ```

@@ -2,7 +2,7 @@
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
 
-Reproducible benchmark suite for **[OspreyDB](https://github.com/ospreydb/osprey-engine)**. Evaluates three subsystems against production baselines: recall-matched single-vector ANN search (`OspreyDB` 1-bit RaBitQ + `f16` rescore vs. `Qdrant` HNSW FP32 / INT8 SQ8 / 1-bit BQ, and `pgvector` HNSW FP32 / FP16 `halfvec`), late-interaction reranking (`LUT-Rank` AVX-512 CPU vs. ColBERTv2 on CPU and CUDA GPU), and object-storage vector search (DP range coalescing with Hilbert page layout over MinIO with `tc netem 15ms` latency).
+Reproducible benchmark suite for **[OspreyDB](https://github.com/ospreydb/ospreydb)**. Evaluates three subsystems against production baselines: recall-matched single-vector ANN search (`OspreyDB` 1-bit RaBitQ + `f16` rescore vs. `Qdrant` HNSW FP32 / INT8 SQ8 / 1-bit BQ, and `pgvector` HNSW FP32 / FP16 `halfvec`), late-interaction reranking (`LUT-Rank` AVX-512 CPU vs. ColBERTv2 on CPU and CUDA GPU), and object-storage vector search (DP range coalescing with Hilbert page layout over MinIO with `tc netem 15ms` latency).
 
 ## Results
 
@@ -112,24 +112,24 @@ Full protocol and per-dataset breakdown: [`results/compare_engines_controlled.md
 
 ## Reproduction
 
-Requires Linux (`x86_64` with AVX-512 recommended), Python 3.10+, Rust toolchain, Docker Compose v2, and a sibling checkout of [`ospreydb/osprey-engine`](https://github.com/ospreydb/osprey-engine) at `../osprey-engine`.
+Requires Linux (`x86_64` with AVX-512 recommended), Python 3.10+, Rust toolchain, Docker Compose v2, and a sibling checkout of [`ospreydb/ospreydb`](https://github.com/ospreydb/ospreydb) at `../ospreydb`.
 
 ```bash
 # 1. Create .venv and install Python dependencies
 make setup
 
-# 2. Build native osprey-engine CLI and osprey-bench-runner (-C target-cpu=native)
-make build-rust OSPREY_SRC=../osprey-engine
+# 2. Build native osprey CLI and osprey-bench-runner (-C target-cpu=native)
+make build-rust OSPREY_SRC=../ospreydb
 
 # 3. Validate Python scripts, CSV/Markdown/SVG consistency, Rust formatting, and Docker Compose config
 make check
 
 # 4. Run the recall-matched controlled benchmark (OspreyDB, Qdrant FP32/SQ8/BQ, pgvector FP32/halfvec)
-make bench-compare-controlled OSPREY_SRC=../osprey-engine
+make bench-compare-controlled OSPREY_SRC=../ospreydb
 
 # 5. Or run the full pipeline (datasets -> MinIO/Docker -> controlled + legacy ANN ->
 #    LUT-Rank -> DP Coalescing S3 Pareto -> perf/ISA audit -> SVG plots)
-make bench-all OSPREY_SRC=../osprey-engine
+make bench-all OSPREY_SRC=../ospreydb
 ```
 
 Individual targets (`make datasets`, `make minio-up`, `make bench-lutrank`, `make bench-pareto`, `make profile-perf`, `make plots`) are documented in [`Makefile`](Makefile).
@@ -140,7 +140,7 @@ Individual targets (`make datasets`, `make minio-up`, `make bench-lutrank`, `mak
 
 - When `candidates = 0` (the default when `--refine-m` is omitted), `SearchOptions::resolve` selects `2000` candidates for `orig_dim <= 256` and `300` for `orig_dim > 256`.
 - When `refine_multiplier = 0` (adaptive default), `orig_dim <= 256` doubles `nprobe` and `candidates` (`nprobe=16, refine_m=1500` → effective `32/3000` on 128d SIFT1M, bounded by the `top_m <= 4096` Stage-1 heap limit) and enforces a 128-vector exact-`f16` rescore floor. For `orig_dim > 256` (e.g., Cohere 768d), `effective == requested`.
-- Pass `--refine-multiplier 1` to disable adaptive doubling or run `make bench-compare-adaptive OSPREY_SRC=../osprey-engine` / `make bench-pareto-adaptive OSPREY_SRC=../osprey-engine` to reproduce the isolated A/B sweeps in `results/compare_engines_adaptive.csv` and `results/pareto_s3_adaptive.csv`.
+- Pass `--refine-multiplier 1` to disable adaptive doubling or run `make bench-compare-adaptive OSPREY_SRC=../ospreydb` / `make bench-pareto-adaptive OSPREY_SRC=../ospreydb` to reproduce the isolated A/B sweeps in `results/compare_engines_adaptive.csv` and `results/pareto_s3_adaptive.csv`.
 
 ## Published Artifacts (`results/`)
 

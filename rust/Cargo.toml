@@ -6,9 +6,9 @@ license = "Apache-2.0"
 description = "Reproducible benchmark runner for OspreyDB (1-bit RaBitQ + DP range coalescing + LUT-Rank)"
 
 [dependencies]
-osprey-core = { git = "https://github.com/ospreydb/osprey-engine.git", branch = "main" }
-osprey-simd = { git = "https://github.com/ospreydb/osprey-engine.git", branch = "main" }
-osprey-storage = { git = "https://github.com/ospreydb/osprey-engine.git", branch = "main" }
+osprey-core = { git = "https://github.com/ospreydb/ospreydb.git", branch = "main", version = "0.1.1" }
+osprey-simd = { git = "https://github.com/ospreydb/ospreydb.git", branch = "main", version = "0.1.1" }
+osprey-storage = { git = "https://github.com/ospreydb/ospreydb.git", branch = "main", version = "0.1.1" }
 
 clap = { version = "4.5", features = ["derive"] }
 axum = "0.8"
