@@ -1055,10 +1055,11 @@ class QdrantEngine:
         return f"ctrl_{self.dataset}_{variant}"
 
     def _wait_ready(
-        self, client: QdrantClient, coll: str, expected: int
+        self, client: QdrantClient, coll: str, expected: int, allow_grey: bool = False
     ) -> None:
         deadline = time.time() + 900
         last = ""
+        ok_statuses = ("green", "grey") if allow_grey else ("green",)
         while time.time() < deadline:
             info = client.get_collection(coll)
             count = client.count(coll, exact=True).count
@@ -1072,7 +1073,7 @@ class QdrantEngine:
             if (
                 count == expected
                 and indexed >= expected
-                and st.endswith("green")
+                and st.endswith(ok_statuses)
                 and "in_progress" not in opt
                 and "indexing" not in opt
                 and "optimizing" not in opt
@@ -1162,7 +1163,7 @@ class QdrantEngine:
         self.current_coll = coll
         client = self._make_client(prefer_grpc=False, timeout=900)
         try:
-            self._wait_ready(client, coll, expected)
+            self._wait_ready(client, coll, expected, allow_grey=True)
         finally:
             try:
                 client.close()
