@@ -103,6 +103,10 @@ enum Cmd {
         engine: String,
         #[arg(long)]
         payloads_file: PathBuf,
+        /// Optional warmup-split JSONL payloads used to warm TCP keep-alive connections
+        /// without touching the measured test-split payloads.
+        #[arg(long)]
+        warmup_payloads_file: Option<PathBuf>,
         #[arg(long, default_value_t = 16)]
         workers: usize,
         #[arg(long)]
@@ -1000,19 +1004,8 @@ fn parse_http_engine_response(engine: &str, body: &[u8]) -> Result<(Vec<u64>, f6
     }
 }
 
-fn run_http_load(
-    url: &str,
-    engine: &str,
-    payloads_file: &Path,
-    workers: usize,
-    out_json: &Path,
-) -> Result<(), String> {
-    if engine != "osprey" && engine != "qdrant" {
-        return Err(format!(
-            "unsupported --engine '{engine}' (expected osprey or qdrant)"
-        ));
-    }
-    let file = File::open(payloads_file).map_err(|e| e.to_string())?;
+fn load_jsonl_payloads(path: &Path) -> Result<Vec<Vec<u8>>, String> {
+    let file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let reader = BufReader::new(file);
     let mut payloads: Vec<Vec<u8>> = Vec::new();
     for line in reader.lines() {
@@ -1022,6 +1015,27 @@ fn run_http_load(
             payloads.push(trimmed.as_bytes().to_vec());
         }
     }
+    Ok(payloads)
+}
+
+fn run_http_load(
+    url: &str,
+    engine: &str,
+    payloads_file: &Path,
+    warmup_payloads_file: Option<&Path>,
+    workers: usize,
+    out_json: &Path,
+) -> Result<(), String> {
+    if engine != "osprey" && engine != "qdrant" {
+        return Err(format!(
+            "unsupported --engine '{engine}' (expected osprey or qdrant)"
+        ));
+    }
+    let payloads = load_jsonl_payloads(payloads_file)?;
+    let warmup_payloads = match warmup_payloads_file {
+        Some(path) => load_jsonl_payloads(path)?,
+        None => Vec::new(),
+    };
     let total = payloads.len();
     let payloads = Arc::new(payloads);
     let n_workers = workers.max(1).min(total.max(1));
@@ -1038,13 +1052,19 @@ fn run_http_load(
             .build()
             .map_err(|e| e.to_string())?;
 
-        // Warm up persistent TCP keep-alive connections across worker slots before timing.
-        if total > 0 {
+        // Warm up persistent TCP keep-alive connections across worker slots before timing,
+        // preferring dedicated warmup-split payloads when provided.
+        let warm_source = if !warmup_payloads.is_empty() {
+            warmup_payloads.as_slice()
+        } else {
+            payloads.as_slice()
+        };
+        if !warm_source.is_empty() {
             let mut warm_handles = Vec::with_capacity(n_workers);
             for wi in 0..n_workers {
                 let c = client.clone();
                 let u = url.to_string();
-                let p = payloads[wi % total].clone();
+                let p = warm_source[wi % warm_source.len()].clone();
                 warm_handles.push(tokio::spawn(async move {
                     let resp = c
                         .post(&u)
@@ -1208,8 +1228,16 @@ fn main() -> Result<(), String> {
             url,
             engine,
             payloads_file,
+            warmup_payloads_file,
             workers,
             out_json,
-        } => run_http_load(&url, &engine, &payloads_file, workers, &out_json),
+        } => run_http_load(
+            &url,
+            &engine,
+            &payloads_file,
+            warmup_payloads_file.as_deref(),
+            workers,
+            &out_json,
+        ),
     }
 }

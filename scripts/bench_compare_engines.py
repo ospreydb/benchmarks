@@ -65,12 +65,17 @@ def get_container_rss_mb(container_name: str) -> float:
 
 
 def dir_size_mb(path: Path) -> float:
+    """Measure allocated on-disk bytes (`st_blocks * 512`) to avoid overcounting sparse holes."""
     if not path.exists():
         return 0.0
     total = 0
     for p in path.rglob("*"):
         if p.is_file():
-            total += p.stat().st_size
+            try:
+                st = p.stat()
+                total += st.st_blocks * 512 if hasattr(st, "st_blocks") else st.st_size
+            except OSError:
+                pass
     return total / (1024.0 * 1024.0)
 
 
@@ -277,7 +282,6 @@ def bench_qdrant(
     rss_query = get_container_rss_mb("osprey-bench-qdrant")
     disk_mb = dir_size_mb(ROOT / "docker" / "qdrant-data" / "collections" / coll)
     arr = np.sort(np.array(latencies_ms))
-    fp32_hnsw_est_mb = (n_vecs * dim * 4 * 1.65) / (1024.0 * 1024.0)
 
     client.delete_collection(coll)
     return {
@@ -286,7 +290,7 @@ def bench_qdrant(
         "build_time_s": round(build_s, 3),
         "peak_rss_mb": round(max(rss_after, rss_query, rss_after - rss_before), 2),
         "build_peak_rss_mb": round(rss_after, 2),
-        "ram_index_mb": round(max(rss_after - rss_before, fp32_hnsw_est_mb * 0.5), 2),
+        "ram_index_mb": round(max(rss_after - rss_before, 0.0), 2),
         "disk_size_mb": round(disk_mb, 2),
         "recall_at_10": round(recall_hits / (len(queries) * 10.0), 4),
         "p50_ms": round(float(np.percentile(arr, 50)), 3),
@@ -430,6 +434,11 @@ def main() -> int:
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--osprey-port", type=int, default=18080)
     parser.add_argument("--controlled-cache-mb", type=int, default=256)
+    parser.add_argument(
+        "--qdrant-on-disk",
+        action="store_true",
+        help="Store Qdrant vectors on disk (VectorParams.on_disk=True) instead of in-RAM.",
+    )
     parser.add_argument("--quick", action="store_true", help="Small grids/splits for smoke testing.")
     parser.add_argument(
         "--out-controlled-csv",
