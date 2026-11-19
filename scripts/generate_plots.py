@@ -57,7 +57,7 @@ ENGINE_MARKERS = {
 }
 DATASET_LABELS = {
     "sift1m": "SIFT1M",
-    "cohere768d": "Cohere 768d (100k)",
+    "cohere768d": "Cohere 768d (1M)",
 }
 
 plt.rcParams.update(
