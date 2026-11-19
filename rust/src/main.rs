@@ -85,6 +85,9 @@ enum Cmd {
         osr: PathBuf,
         #[arg(long)]
         queries_json: PathBuf,
+        /// Optional persisted Stage-1 candidate sets JSON matching bench_lutrank_vs_colbert.py.
+        #[arg(long)]
+        candidates_json: Option<PathBuf>,
         #[arg(long, default_value_t = 200)]
         candidates_per_query: usize,
         #[arg(long, default_value_t = 10)]
@@ -266,11 +269,35 @@ async fn handle_server_search(
 
 #[derive(Debug, Deserialize)]
 struct BeirQuery {
-    #[allow(dead_code)]
     query_id: String,
     tokens: Vec<Vec<f32>>,
     #[serde(default)]
     qrels: HashMap<String, i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CandidateQueryEntry {
+    query_id: String,
+    candidate_ids: Vec<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CandidatesFile {
+    queries: Vec<CandidateQueryEntry>,
+}
+
+fn load_candidates_file(path: &Path) -> Result<(HashMap<String, Vec<u64>>, Vec<Vec<u64>>), String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("read candidates {}: {e}", path.display()))?;
+    let parsed: CandidatesFile = serde_json::from_str(&raw)
+        .map_err(|e| format!("parse candidates {}: {e}", path.display()))?;
+    let mut by_id = HashMap::with_capacity(parsed.queries.len());
+    let mut by_pos = Vec::with_capacity(parsed.queries.len());
+    for entry in parsed.queries {
+        by_pos.push(entry.candidate_ids.clone());
+        by_id.insert(entry.query_id, entry.candidate_ids);
+    }
+    Ok((by_id, by_pos))
 }
 
 #[derive(Debug, Serialize)]
@@ -783,6 +810,7 @@ fn dcg_at_k(relevances: &[f64], k: usize) -> f64 {
 fn run_lutrank_eval(
     osr_path: &Path,
     queries_json: &Path,
+    candidates_json: Option<&Path>,
     candidates_per_query: usize,
     top_k: usize,
     max_queries: usize,
@@ -799,6 +827,10 @@ fn run_lutrank_eval(
     let raw_q = std::fs::read_to_string(queries_json).map_err(|e| e.to_string())?;
     let queries: Vec<BeirQuery> = serde_json::from_str(&raw_q).map_err(|e| e.to_string())?;
     let q_count = queries.len().min(max_queries);
+    let external_cands = match candidates_json {
+        Some(path) => Some(load_candidates_file(path)?),
+        None => None,
+    };
 
     let simd = SimdEngine::new_auto();
     let mut lut_synth_us = Vec::with_capacity(q_count);
@@ -819,24 +851,41 @@ fn run_lutrank_eval(
             flat_tokens.extend_from_slice(tok);
         }
 
-        // Deterministic candidate set of size `candidates_per_query`:
-        // includes all relevant docs for `q` plus deterministic non-relevant negatives from `.osr`.
-        let mut cand_ids: Vec<u64> = Vec::with_capacity(candidates_per_query);
-        let mut seen: HashSet<u64> = HashSet::with_capacity(candidates_per_query);
-        for doc_str in q.qrels.keys() {
-            if let Ok(did) = doc_str.parse::<u64>() {
-                if seen.insert(did) {
-                    cand_ids.push(did);
+        let cand_ids: Vec<u64> = if let Some((by_id, by_pos)) = &external_cands {
+            let src = by_id
+                .get(&q.query_id)
+                .or_else(|| by_pos.get(qi))
+                .ok_or_else(|| {
+                    format!(
+                        "missing candidate list for query_id='{}' (index {qi}) in candidates JSON",
+                        q.query_id
+                    )
+                })?;
+            src.iter()
+                .copied()
+                .take(candidates_per_query.max(1))
+                .collect()
+        } else {
+            // Deterministic fallback candidate set of size `candidates_per_query`:
+            // includes all relevant docs for `q` plus deterministic non-relevant negatives from `.osr`.
+            let mut ids: Vec<u64> = Vec::with_capacity(candidates_per_query);
+            let mut seen: HashSet<u64> = HashSet::with_capacity(candidates_per_query);
+            for doc_str in q.qrels.keys() {
+                if let Ok(did) = doc_str.parse::<u64>() {
+                    if seen.insert(did) {
+                        ids.push(did);
+                    }
                 }
             }
-        }
-        let mut cursor = ((qi * 7919) % num_docs.max(1)) as u64;
-        while cand_ids.len() < candidates_per_query && cand_ids.len() < num_docs {
-            if seen.insert(cursor) {
-                cand_ids.push(cursor);
+            let mut cursor = ((qi * 7919) % num_docs.max(1)) as u64;
+            while ids.len() < candidates_per_query && ids.len() < num_docs {
+                if seen.insert(cursor) {
+                    ids.push(cursor);
+                }
+                cursor = (cursor + 17) % (num_docs as u64);
             }
-            cursor = (cursor + 17) % (num_docs as u64);
-        }
+            ids
+        };
         prepared.push(PreparedLutQuery {
             flat_tokens,
             num_tokens: q.tokens.len(),
@@ -1212,6 +1261,7 @@ fn main() -> Result<(), String> {
         Cmd::LutrankEval {
             osr,
             queries_json,
+            candidates_json,
             candidates_per_query,
             top_k,
             max_queries,
@@ -1219,6 +1269,7 @@ fn main() -> Result<(), String> {
         } => run_lutrank_eval(
             &osr,
             &queries_json,
+            candidates_json.as_deref(),
             candidates_per_query,
             top_k,
             max_queries,
@@ -1239,5 +1290,35 @@ fn main() -> Result<(), String> {
             workers,
             &out_json,
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_candidates_json_by_id_and_position() {
+        let dir =
+            std::env::temp_dir().join(format!("osprey_bench_cands_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("candidates.json");
+        let payload = r#"{
+            "dataset": "scifact",
+            "candidate_source": "stage1-dense",
+            "candidates_per_query": 3,
+            "num_queries": 2,
+            "queries": [
+                {"query_id": "q1", "candidate_ids": [10, 20, 30]},
+                {"query_id": "q2", "candidate_ids": [5, 15]}
+            ]
+        }"#;
+        std::fs::write(&path, payload).expect("write candidates json");
+        let (by_id, by_pos) = load_candidates_file(&path).expect("load candidates");
+        assert_eq!(by_id.get("q1"), Some(&vec![10, 20, 30]));
+        assert_eq!(by_id.get("q2"), Some(&vec![5, 15]));
+        assert_eq!(by_pos.len(), 2);
+        assert_eq!(by_pos[0], vec![10, 20, 30]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
