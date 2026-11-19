@@ -8,7 +8,7 @@ Reproducible benchmark suite for **[OspreyDB](https://github.com/ospreydb/osprey
 
 ### SIFT1M (1M × 128d)
 
-Recall-matched evaluation (`Recall@10` targets `0.95` and `0.97`, 925 unique test queries, 16 concurrent workers via Rust `http-load` for HTTP engines, OspreyDB bounded to a 256 MiB page cache, symmetric query-only `cgroup v2 memory.peak` after post-build page-cache eviction). Raw data: [`results/compare_engines_controlled.csv`](results/compare_engines_controlled.csv).
+Recall-matched evaluation (`Recall@10` targets `0.95` and `0.97`, 925 unique test queries, 16 concurrent workers via Rust `http-load` for HTTP engines, L2-normalized SIFT1M vectors, OspreyDB bounded to `--controlled-cache-mb 256`—which exceeds the `.osv` slab size on both `1M×128d` (`213 MiB` total) and `100k×768d` (`152 MiB` total)—and symmetric query-only `cgroup v2 memory.peak` after post-build page-cache eviction). Note that `osprey-bench-runner serve` is a static read-only HTTP wrapper (not a full transactional DB), `build_time_s` mixes local Parquet Rust import with Python JSON/text ingestion for Qdrant/`pgvector`, and `pgvector` used Python `psycopg` rather than the Rust HTTP client. Raw data: [`results/compare_engines_controlled.csv`](results/compare_engines_controlled.csv).
 
 | Engine | Target | R@10 | P50 (ms) | P95 (ms) | QPS (16w) | RAM (MiB) | Disk (MiB) | Build (s) |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -50,6 +50,7 @@ Recall-matched evaluation (`Recall@10` targets `0.95` and `0.97`, 925 unique tes
 | pgvector halfvec | 0.97 | 0.9747 | 1.22 | 1.52 | 4,043 | 450 | 354 | 34.0 |
 
 - At 768 dimensions, OspreyDB is the only engine meeting both `0.95` (`0.9669`) and `0.97` (`0.9889`) test targets with sub-millisecond P50 latency (`0.60–0.78 ms`) and the highest throughput (`9,960 / 8,022 QPS`), while using **3.7× less RAM** than Qdrant FP32 (`387 MiB` vs. `1,436 MiB`), **3.8× less** than Qdrant SQ8 (`1,462 MiB`), **1.7× less** than `pgvector` FP32 (`663 MiB`), and **1.2× less** than `pgvector halfvec` (`450 MiB`), and **2.3×–5.3× less disk** (`152 MiB`).
+- **Qdrant caveats on Cohere 768d:** Qdrant FP32 and SQ8 exhibited an anomalous `~430 QPS` plateau (`ef=64` vs. `96` flat latency at `2.76–2.89 ms`) likely due to segment fragmentation or indexing threshold behavior on `100k×768d`, whereas Qdrant BQ reached `4,844 QPS` (`0.551 ms` P50) on the same dataset (and was capped at `oversampling=3.0` = 30 rescore candidates vs. OspreyDB's 300).
 
 ![Controlled Peak Memory and Disk Footprint](results/figures/fig1_memory_disk_controlled.svg)
 
@@ -60,6 +61,8 @@ Additional controlled plots: [Index Build Time (`fig3`)](results/figures/fig3_bu
 ### Late-Interaction Reranking: `LUT-Rank` vs. ColBERTv2
 
 Reranking 200 candidate passages per query across 100 queries on MS MARCO, BEIR SciFact, and BEIR FiQA. `†` denotes the fastest CPU engine. Raw data: [`results/lutrank_vs_colbert.csv`](results/lutrank_vs_colbert.csv).
+
+> **Input & Workload Disclosure:** The published numbers below use **synthetic 128d BLAKE2b trigram-hashed token vectors (`32` doc tokens × `12` query tokens) with oracle `qrels` + deterministic negatives**, NOT neural `colbert-ir/colbertv2.0` embeddings (which are anisotropic and `120–180 × 32` tokens). Re-evaluation with real neural ColBERTv2 embeddings is tracked in the harness upgrade.
 
 | Dataset | Engine | Device | P50 (ms) | P99 (ms) | QPS | NDCG@10 | MRR@10 | Index (MiB) |
 | :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -79,7 +82,7 @@ Reranking 200 candidate passages per query across 100 queries on MS MARCO, BEIR 
 | FiQA | ColBERTv2 Exact (NumPy) | BLAS CPU | 0.864 | 0.955 | 1,143 | 0.4372 | 0.5122 | 892.0 |
 | FiQA | ColBERTv2 (PyTorch) | CUDA GPU | 0.229 | 0.338 | 4,126 | 0.4389 | 0.5137 | 892.0 |
 
-- `LUT-Rank` (`vpshufb` 4-bit lookup tables synthesized in `6.7–10.8 µs/query`) compresses `.osr` token lattices **7.9×** versus ColBERTv2 across all three datasets (`97.2 MiB` vs. `768.4 MiB` on MS MARCO) while retaining `98.6%` of exact `NDCG@10` and leading CPU throughput (`2,849 QPS`, `0.329 ms` P50) on MS MARCO.
+- `LUT-Rank` (`vpshufb` 4-bit lookup tables synthesized in `6.7–10.8 µs/query`) compresses `.osr` token lattices **7.9×** versus ColBERTv2 across all three datasets (`97.2 MiB` vs. `768.4 MiB` on MS MARCO), which is its primary advantage across all three datasets, while retaining `98.6%` of exact `NDCG@10` on MS MARCO. In latency/throughput, `LUT-Rank` leads CPU on MS MARCO (`2,849 QPS`, `0.329 ms` P50), whereas **PyTorch CPU was faster in P50/QPS on SciFact and FiQA** (`0.345 / 0.428 ms` P50 and `2,398 / 2,220 QPS` vs. LUT-Rank's `0.505 / 0.519 ms` and `2,122 / 2,006 QPS`).
 
 ![LUT-Rank CPU vs ColBERTv2 CPU/GPU](results/figures/fig6_lutrank_cpu_vs_gpu.svg)
 
@@ -88,8 +91,9 @@ Reranking 200 candidate passages per query across 100 queries on MS MARCO, BEIR 
 39-point `nprobe × refine_m` sweep on Cohere 768d (100k vectors) stored in MinIO with kernel-injected `tc netem delay 15ms` (`16.78 ms` measured RTT, `--cache-mb 0`). Raw data: [`results/pareto_s3.csv`](results/pareto_s3.csv).
 
 - At `Recall@10 = 0.970` (`nprobe=32, refine_m=200`), Hilbert-curve page layout + DP range coalescing (`tau_req = 256 KiB`) merges `161.0` candidate `.osv` pages into **66.3 S3 Range-GETs** (**2.4× fewer requests** than uncoalesced fetching, `95.0 ms` P50); at `Recall@10 = 0.978` (`nprobe=48, refine_m=300`), it merges `234.5` pages into **84.2 S3 Range-GETs** (**2.8× fewer requests**, `110.5 ms` P50), reaching up to **3.3×** fewer GETs at `8/300` while keeping local `VmHWM` between **`56.2 MiB` and `112.6 MiB`** with zero local `.osv` disk or slab cache.
+- **Coalescing & dimensionality trade-offs:** Across the paired sweep points in [`results/pareto_s3.csv`](results/pareto_s3.csv), DP coalescing cuts S3 Range-GET count and request cost by **2.4×–3.3×** while increasing bytes fetched (**~2.5×–2.9×**, e.g. `5.88 MB` ON vs. `2.05 MB` OFF at `32/200`) and slightly raising single-stream sequential P50 (`95.0 ms` ON vs. `90.3 ms` OFF at `32/200`) under local MinIO `tc netem`. Moreover, low-dimensional 128d SIFT1M requires **`~647 GETs / 48.7 MB` per query** for `0.969` recall ([`results/sift1m_adaptive_recall_recovery.json`](results/sift1m_adaptive_recall_recovery.json)), making high-dimensional embeddings (`768d+`) the sweet spot for S3-backed search.
 
-![DP Range Coalescing S3 Range-GET Reduction](results/figures/fig5_coalesced_s3_requests_16x.svg)
+![DP Range Coalescing S3 Range-GET Reduction](results/figures/fig5_coalesced_s3_requests.svg)
 
 ![DP Range Coalescing Pareto Frontier: Recall@10 vs S3 Latency](results/figures/fig7_pareto_recall_latency_s3.svg)
 
@@ -99,14 +103,14 @@ Full protocol and per-dataset breakdown: [`results/compare_engines_controlled.md
 
 1. **Why Qdrant 1-bit BQ collapses on SIFT1M (`R@10 = 0.0666`) vs. Cohere 768d (`0.9173`), while OspreyDB RaBitQ reaches `0.9738` / `0.9889`:**
    SIFT1M descriptors are non-negative ($\mathbf{x} \in \mathbb{R}_{\ge 0}^{128}$). Standard 1-bit binary quantization takes $\operatorname{sign}(\mathbf{x})$ without centering, mapping almost every coordinate in the positive orthant to `111...1` and destroying Hamming distance discrimination. Cohere 768d embeddings are centered near the origin, so uncentered sign quantization partially works (`0.9173`). OspreyDB's `RaBitQ` quantizes the **centroid-centered residual** ($\mathbf{x} - \mathbf{c}$) after a randomized Fast Walsh-Hadamard Transform (FWHT) rotation, ensuring balanced variance across all rotated coordinates regardless of input orthant bias, followed by exact `f16` Stage-2 rescoring.
-2. **In-process execution vs. loopback client-server transport:**
-   In `compare_engines_controlled.csv`, OspreyDB runs as an HTTP server (`osprey-bench-runner serve`) and both OspreyDB and Qdrant are driven by the exact same compiled Rust HTTP/1.1 keep-alive load client (`osprey-bench-runner http-load`) over loopback localhost (isolating ~0.06–0.15 ms loopback TCP overhead equally on both engines; `server_p50_ms_median` is also exported separately). `pgvector` uses SQL over localhost (`psycopg`), with server execution time measured via `EXPLAIN ANALYZE`. Native in-process callers linking `osprey-core` directly bypass HTTP serialization and TCP overhead completely.
+2. **In-process execution, static HTTP wrapper, and ingestion/client asymmetry:**
+   In `compare_engines_controlled.csv`, OspreyDB runs as a static, read-only HTTP server (`osprey-bench-runner serve` over prebuilt `.osi`/`.osv` files, not a full transactional DB), and both OspreyDB and Qdrant are driven by the exact same compiled Rust HTTP/1.1 keep-alive load client (`osprey-bench-runner http-load`) over loopback localhost (isolating ~0.06–0.15 ms loopback TCP overhead equally on both engines; `server_p50_ms_median` is also exported separately). `pgvector` uses Python `psycopg` over localhost SQL rather than the Rust HTTP client, with server execution time measured via `EXPLAIN ANALYZE`. `build_time_s` mixes local Parquet Rust import (`osprey import`) with Python JSON/text ingestion for Qdrant and `pgvector`, and OspreyDB's `4,329.2 MiB` `Build peak (MiB)` in `compare_engines_controlled.md` is a known `systemd-run` cgroup-scope startup latch artifact (actual `osprey import` peak RSS in `results/compare_engines.csv` is `431.5 MiB` on SIFT1M and `691.4 MiB` on Cohere). Native in-process callers linking `osprey-core` directly bypass HTTP serialization and TCP overhead completely.
 3. **Local NVMe memory (`cgroup v2 memory.peak` / `VmHWM`) vs. S3 zero-slab-RAM:**
-   In the local NVMe controlled benchmark, OspreyDB's `642.3 MiB` (SIFT1M) and `387.0 MiB` (Cohere) `cgroup v2 memory.peak` figures (and `466.2 MiB` / `258.2 MiB` `VmHWM`) include Linux OS page-cache pages touched while reading the local `.osv` slab file. In the S3 object-storage benchmark ([`results/pareto_s3.csv`](results/pareto_s3.csv), `--cache-mb 0`), the `.osv` slab lives 100% in MinIO/S3, so OspreyDB only maps the 1-bit `.osi` index and transient Range-GET buffers—keeping total local `VmHWM` at **`56.2–112.6 MiB`** (`111–177 MiB` on SIFT1M).
-4. **100M-vector S3 vs. RAM TCO formula:**
-   Because `.osi` + `.osv` footprints scale linearly with vector count ($N$), the 100M-vector cloud storage and request cost can be computed directly from measured per-vector artifacts and `Range-GET` counts:
+   In the local NVMe controlled benchmark, `--controlled-cache-mb 256` exceeds the `.osv` (and total `.osi+.osv`) file size on both `1M×128d` (`213 MiB` total) and `100k×768d` (`152 MiB` total); OspreyDB's `642.3 MiB` (SIFT1M) and `387.0 MiB` (Cohere) `cgroup v2 memory.peak` figures (and `466.2 MiB` / `258.2 MiB` `VmHWM`) include Linux OS page-cache pages touched while reading the local `.osv` slab file. In the S3 object-storage benchmark ([`results/pareto_s3.csv`](results/pareto_s3.csv), `--cache-mb 0`), the `.osv` slab lives 100% in MinIO/S3, so OspreyDB only maps the 1-bit `.osi` index and transient Range-GET buffers—keeping total local `VmHWM` at **`56.2–112.6 MiB`** (`111–184 MiB` adaptive; `98–144 MiB` baseline on SIFT1M, per [`results/pareto_s3_adaptive.csv`](results/pareto_s3_adaptive.csv)).
+4. **100M-vector S3 vs. RAM TCO formula (back-of-the-envelope lower bound):**
+   Because `.osi` + `.osv` footprints scale linearly with vector count ($N$), the 100M-vector cloud storage footprint and an optimistic lower-bound request cost can be estimated from the 100k Cohere artifact (`15.01 MiB` `.osi` + `136.84 MiB` `.osv`):
    $$\text{Monthly Cost}_{\text{S3}} = \text{GB}_{\text{osi+osv}} \times \$0.023/\text{GB-mo} + \frac{Q_{\text{month}} \times \text{GETs/query}}{1000} \times \$0.0004 + \text{EC2}_{\text{compute}}$$
-   For 100M 768d vectors (scaling 1,000× from the 100k Cohere artifact: `15.01 MiB` `.osi` + `136.84 MiB` `.osv` $\rightarrow$ `~14.7 GiB` `.osi` in RAM + `~133.6 GiB` `.osv` in S3 Standard = `~$3.07/mo` S3 storage, plus `$0.0265` per 1M queries at `66.3 GETs/query` vs. hosting `~1,400 GiB` of unquantized HNSW RAM across memory-optimized EC2 `r6i`/`r7i` instances).
+   Scaling 1,000× from 100k to 100M 768d vectors yields `~14.7 GiB` `.osi` (in RAM) + `~133.6 GiB` `.osv` (in S3) = `148.3 GiB` total, or **`~$3.41/mo`** S3 Standard for `.osi + .osv` (`~$3.07/mo` for `.osv` alone), plus **`$26.52 per 1M queries`** (`$0.0265 per 1,000 queries` from `1,000,000 × 66.3 / 1,000 × $0.0004`) at `66.3 GETs/query` — compared against hosting `~1,400 GiB` of unquantized FP32 HNSW RAM across memory-optimized EC2 `r6i`/`r7i` instances. **Caveats:** Holding `66.3 GETs/query` constant from `100k` to `100M` vectors is an **optimistic lower-bound back-of-the-envelope estimate** (at 100M vectors, `clusters`/`nprobe` scale up and Hilbert locality across `133.6 GiB` decreases, increasing GETs/query), and production competitors also deploy quantized/disk-backed modes (such as Qdrant SQ8/BQ, DiskANN, and `pgvector halfvec`), not only unquantized FP32 HNSW in RAM.
 5. **Symmetric accounting & zero query repetition:**
    Every engine is run in isolation, stopped/restarted after index build, and stripped of host OS page cache before calibration (`25%` split) and measurement (`200` warmup + `925` unique SIFT1M / `550` unique Cohere test queries × `3` rounds, `16` concurrent workers).
 

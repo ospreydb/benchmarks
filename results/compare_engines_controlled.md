@@ -21,16 +21,23 @@ Figures: [`fig1_memory_disk_controlled.svg`](figures/fig1_memory_disk_controlled
 - Measurement: 200 warmup queries plus every remaining test query, with no
   repetition, in 3 rounds and 16 concurrent workers. SIFT measured 925 unique
   test queries; Cohere measured 550.
-- OspreyDB used a bounded 256 MiB cache. Exactly one engine was active at a
-  time; containers were restarted and Linux host page cache was evicted after
-  index build (`posix_fadvise(POSIX_FADV_DONTNEED)` / `dd iflag=nocache`) so
-  query-stage `cgroup v2 memory.peak` is measured symmetrically for all 6
-  engines (capturing both process RSS and page-cache-resident index blocks).
+- OspreyDB used `--controlled-cache-mb 256` (a bounded 256 MiB cache, which
+  exceeds the total `.osi+.osv` footprint on both SIFT1M at `212.93 MiB` and
+  Cohere 768d at `151.85 MiB`, so the working set fits in cache once warmed).
+  Exactly one engine was active at a time; containers were restarted and Linux
+  host page cache was evicted after index build
+  (`posix_fadvise(POSIX_FADV_DONTNEED)` / `dd iflag=nocache`) so query-stage
+  `cgroup v2 memory.peak` is measured symmetrically for all 6 engines (capturing
+  both process RSS and page-cache-resident index blocks).
+- Serving & ingestion scope: `osprey-bench-runner serve` is a static, read-only
+  HTTP wrapper over prebuilt `.osi`/`.osv` files (not a full transactional
+  multi-tenant database). `build_time_s` mixes local Parquet Rust import
+  (`osprey import`) with Python JSON/text ingestion for Qdrant and `pgvector`.
 - HTTP transport (`osprey_http`, `qdrant_fp32`, `qdrant_sq8`, `qdrant_bq`) uses
   the compiled Rust `http-load` keep-alive client (`osprey-bench-runner`) with
-  precomputed JSON payloads outside the timed loop; `pgvector` uses SQL over
-  localhost (`psycopg`), with server execution time sampled via `EXPLAIN ANALYZE`
-  on 100 queries.
+  precomputed JSON payloads outside the timed loop; `pgvector` uses Python
+  `psycopg` over localhost SQL rather than the Rust HTTP client, with server
+  execution time sampled via `EXPLAIN ANALYZE` on 100 queries.
 
 ## SIFT1M
 
@@ -89,6 +96,8 @@ Figures: [`fig1_memory_disk_controlled.svg`](figures/fig1_memory_disk_controlled
 ### What changed with the symmetric harness
 
 - **Symmetric `cgroup v2 memory.peak` (query-only):** Every engine (including OspreyDB inside `systemd-run --user --scope`) is restarted after build, host page cache is evicted, and query-stage memory is read from `memory.peak`. Both process RSS (`process_vmhwm_mb`) and cgroup peak (`query_peak_rss_mb`) are exported.
+- **Build peak RSS caveat (`4,329.2 MiB`):** OspreyDB's `4,329.2 MiB` `Build peak (MiB)` figure in the tables above is a known `systemd-run` cgroup-scope startup latch artifact; actual `osprey import` peak RSS recorded in [`results/compare_engines.csv`](compare_engines.csv) is `431.5 MiB` on SIFT1M and `691.4 MiB` on Cohere 768d.
+- **Cache sizing & harness scope:** `--controlled-cache-mb 256` exceeds the `.osv` (and total `.osi+.osv`) file size on both `1M×128d` (`212.93 MiB`) and `100k×768d` (`151.85 MiB`). Additionally, `osprey-bench-runner serve` is a static read-only HTTP wrapper, `build_time_s` compares local Rust Parquet import against Python JSON/text ingestion for Qdrant/`pgvector`, and `pgvector` used Python `psycopg` rather than the Rust HTTP client.
 - **Rust `http-load` client:** Removing Python `httpx` client queueing reveals true server-side HTTP throughput (`9,960 QPS` for OspreyDB on Cohere 768d and `17,481 QPS` for Qdrant SQ8 on SIFT1M).
 - **Quantized competitor baselines (`Qdrant SQ8` and `pgvector halfvec`):** Both quantized competitors are included directly alongside FP32 and 1-bit BQ.
 
@@ -102,7 +111,7 @@ Figures: [`fig1_memory_disk_controlled.svg`](figures/fig1_memory_disk_controlled
 
 - **Only engine meeting both targets:** OspreyDB reaches `0.9669` at target `0.95` and `0.9889` at target `0.97`, delivering sub-millisecond sequential P50 (`0.602 / 0.777 ms`) and the highest concurrent throughput (`9,960.0 / 8,022.3 QPS`).
 - **Lowest memory, disk, and build time:** OspreyDB uses `387.0 MiB` cgroup peak (`258.2 MiB` `VmHWM`) and `151.85 MiB` disk, compared to `1,435.5 MiB` / `799.37 MiB` for Qdrant FP32 (**3.7×** RAM, **5.3×** disk), `1,461.8 MiB` / `750.42 MiB` for Qdrant SQ8 (**3.8×** RAM, **4.9×** disk), `662.9 MiB` / `793.87 MiB` for `pgvector` FP32 (**1.7×** RAM, **5.2×** disk), and `450.5 MiB` / `354.04 MiB` for `pgvector halfvec` (**1.2×** RAM, **2.3×** disk).
-- **Cold-cache Qdrant FP32/SQ8 behavior:** After post-build restart and page-cache eviction without `always_ram` on full FP32 vectors, Qdrant FP32 and SQ8 incur disk-backed rescore reads (`~2.8 ms` P50, `~430 QPS`), whereas `pgvector halfvec` keeps its compact `354 MiB` FP16 index warm (`0.783 / 1.220 ms`, `6,148 / 4,043 QPS`, though its `0.95` calibration `ef_search=32` misses slightly on test at `0.9420`).
+- **Qdrant FP32/SQ8 & BQ caveats on Cohere 768d:** Qdrant FP32 and SQ8 exhibited an anomalous `~430 QPS` plateau (`2.76–2.89 ms` sequential P50, flat across `ef=64` and `ef=96`) likely due to segment fragmentation or indexing threshold behavior on `100k×768d`, whereas Qdrant BQ reached `4,844 QPS` (`0.551 ms` P50) on the same dataset (and was capped at `oversampling=3.0` = 30 rescore candidates vs. OspreyDB's 300). Meanwhile, `pgvector halfvec` keeps its compact `354 MiB` FP16 index warm (`0.783 / 1.220 ms`, `6,148 / 4,043 QPS`, though its `0.95` calibration `ef_search=32` misses slightly on test at `0.9420`).
 
 ## Reproduction
 
