@@ -7,8 +7,8 @@ Generates:
   2. fig2_recall_latency_controlled.svg     : Test Recall@10 vs client P50 latency
   3. fig3_build_time_controlled.svg         : Index build time per engine
   4. fig4_validation_test_recall_controlled.svg : Validation vs test recall at each target
-  5. fig5_coalesced_s3_requests_16x.svg     : S3 Range-GET reduction with DP range coalescing vs uncoalesced GETs
-  6. fig6_lutrank_cpu_vs_gpu.svg            : LUT-Rank CPU (~3.8 ms) vs ColBERTv2 CPU & GPU latency & NDCG@10
+  5. fig5_coalesced_s3_requests.svg         : S3 Range-GET reduction with DP range coalescing vs uncoalesced GETs
+  6. fig6_lutrank_cpu_vs_gpu.svg            : LUT-Rank CPU vs ColBERTv2 CPU & GPU latency & NDCG@10
   7. fig7_pareto_recall_latency_s3.svg      : Pareto curve Recall@10 vs Latency (ms) vs S3 Requests
 """
 
@@ -162,18 +162,18 @@ def plot_fig1_controlled_memory() -> None:
 
         ax.set_xticks(x)
         ax.set_xticklabels(engines, fontsize=8.5, rotation=20, ha="right")
-        ax.set_ylabel("MiB (log scale)")
-        ax.set_yscale("log")
+        ax.set_ylabel("MiB")
         all_vals = mem_vals + disk_vals
-        if all_vals:
-            ax.set_ylim(max(1.0, min(all_vals) * 0.5), max(all_vals) * 2.4)
+        max_val = max(all_vals) if all_vals else 1.0
+        ax.set_ylim(0, max_val * 1.18)
         ax.set_title(f"{DATASET_LABELS.get(ds, ds.upper())} — Peak memory and disk")
         ax.legend(frameon=True, fontsize=8.5, loc="upper left")
 
+        label_offset = max_val * 0.015
         for bar, value in zip(mem_bars, mem_vals):
             ax.text(
                 bar.get_x() + bar.get_width() / 2.0,
-                value * 1.10,
+                value + label_offset,
                 f"{value:.0f}",
                 ha="center",
                 va="bottom",
@@ -183,7 +183,7 @@ def plot_fig1_controlled_memory() -> None:
         for bar, value in zip(disk_bars, disk_vals):
             ax.text(
                 bar.get_x() + bar.get_width() / 2.0,
-                value * 1.10,
+                value + label_offset,
                 f"{value:.0f}",
                 ha="center",
                 va="bottom",
@@ -210,6 +210,8 @@ def plot_fig2_controlled_recall_latency() -> None:
     for idx, ds in enumerate(datasets):
         ax = axes[0, idx]
         ds_rows = [r for r in rows if r["dataset"] == ds]
+        y_low, y_high = 88.0, 100.5
+        off_scale_notes = []
         for engine in ENGINE_ORDER:
             engine_rows = sorted(
                 [r for r in ds_rows if controlled_engine_label(r["engine"]) == engine],
@@ -232,24 +234,32 @@ def plot_fig2_controlled_recall_latency() -> None:
                 markeredgecolor="#0F172A",
                 markeredgewidth=0.6,
             )
-            if engine == "Qdrant BQ" and min(ys) < 50.0:
-                ax.annotate(
-                    "BQ below target",
-                    (xs[0], ys[0]),
-                    textcoords="offset points",
-                    xytext=(8, 8),
-                    fontsize=8,
-                    color=ENGINE_COLORS[engine],
-                    fontweight="bold",
-                )
+            if min(ys) < y_low:
+                min_idx = int(np.argmin(ys))
+                off_scale_notes.append((engine, xs[min_idx], ys[min_idx]))
 
         ax.axhline(95.0, color="#DC2626", linestyle=":", linewidth=1.1, label="target 0.95")
         ax.axhline(97.0, color="#B91C1C", linestyle="--", linewidth=1.1, label="target 0.97")
         ax.set_xlabel("P50 client latency, sequential (ms)")
         ax.set_ylabel("Test Recall@10 (%)")
-        ax.set_ylim(0, 102)
+        ax.set_ylim(y_low, y_high)
         ax.set_title(f"{DATASET_LABELS.get(ds, ds.upper())} — Recall vs latency")
-        ax.legend(frameon=True, fontsize=8)
+        ax.legend(frameon=True, fontsize=8, loc="lower right")
+
+        for engine, x_val, y_val in off_scale_notes:
+            ax.annotate(
+                f"{engine}: {y_val:.2f}%\n(off-scale, below {y_low:.0f}%)",
+                xy=(x_val, y_low + 0.05),
+                xytext=(x_val, y_low + 2.4),
+                ha="center",
+                va="bottom",
+                fontsize=7.8,
+                fontweight="bold",
+                color=ENGINE_COLORS.get(engine, "#0F172A"),
+                bbox=dict(boxstyle="round,pad=0.25", fc="#F5F3FF", ec=ENGINE_COLORS.get(engine, "#7C3AED"), lw=0.9),
+                arrowprops=dict(arrowstyle="-|>", color=ENGINE_COLORS.get(engine, "#7C3AED"), lw=1.2),
+                zorder=6,
+            )
 
     fig.tight_layout()
     out = FIG_DIR / "fig2_recall_latency_controlled.svg"
@@ -480,7 +490,7 @@ def plot_fig5_coalesced_s3() -> None:
     ax2.legend(frameon=True, fontsize=8.5, loc="upper left")
 
     fig.tight_layout()
-    out = FIG_DIR / "fig5_coalesced_s3_requests_16x.svg"
+    out = FIG_DIR / "fig5_coalesced_s3_requests.svg"
     fig.savefig(out, format="svg")
     plt.close(fig)
     print(f"[plot] {out}")
@@ -503,6 +513,7 @@ def plot_fig6_lutrank() -> None:
     width = 0.72 / max(1, len(engines))
     colors = ["#0F766E", "#64748B", "#0284C7", "#2563EB", "#DC2626", "#D97706"]
 
+    max_p50 = max((float(r["p50_ms"]) for r in rows), default=1.0)
     for ei, eng in enumerate(engines):
         p50s = []
         ndcgs = []
@@ -515,14 +526,14 @@ def plot_fig6_lutrank() -> None:
         ax2.bar(x + offset, ndcgs, width=width * 0.9, label=eng, color=colors[ei % len(colors)], edgecolor="#0F172A", lw=0.6)
         for bar, val in zip(b1, p50s):
             if val > 0:
-                ax1.text(bar.get_x() + bar.get_width() / 2.0, val * 1.03, f"{val:.2f}ms", ha="center", va="bottom", fontsize=7.5)
+                ax1.text(bar.get_x() + bar.get_width() / 2.0, val + max_p50 * 0.015, f"{val:.2f}", ha="center", va="bottom", fontsize=7.0)
 
-    ax1.axhline(3.8, color="#DC2626", linestyle=":", linewidth=1.2, label="LUT-Rank 3.8 ms CPU Budget")
     ax1.set_xticks(x)
     ax1.set_xticklabels([d.upper() for d in datasets])
     ax1.set_ylabel("P50 Rerank Latency / Query (ms)")
+    ax1.set_ylim(0, max_p50 * 1.35)
     ax1.set_title("LUT-Rank CPU vs ColBERTv2 Latency (200 Docs)")
-    ax1.legend(frameon=True, fontsize=8)
+    ax1.legend(frameon=True, fontsize=7.5, loc="upper left", ncol=2)
 
     ax2.set_xticks(x)
     ax2.set_xticklabels([d.upper() for d in datasets])
