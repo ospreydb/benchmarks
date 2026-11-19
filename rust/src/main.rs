@@ -558,6 +558,37 @@ fn normalize_slabs_uri(slabs: &str) -> Result<String, String> {
     }
 }
 
+/// Initializes query-time `ObjectStore` plus a metadata-load `ObjectStore` with a generous
+/// timeout so multi-megabyte 1M+ segment directories finish transferring over emulated WANs.
+fn open_remote_osv(
+    slabs: &str,
+    rt: &tokio::runtime::Runtime,
+) -> Result<
+    (
+        Arc<dyn ObjectStore>,
+        ObjectPath,
+        RemoteStoreConfig,
+        Vec<MinipageDirectoryEntry>,
+        Option<Vec<u8>>,
+        u64,
+    ),
+    String,
+> {
+    let slabs_uri = normalize_slabs_uri(slabs)?;
+    let remote_cfg = RemoteStoreConfig::default();
+    let (store, obj_path) =
+        build_object_store(&slabs_uri, &remote_cfg).map_err(|e| e.to_string())?;
+    let meta_cfg = RemoteStoreConfig {
+        request_timeout_ms: 30_000,
+        ..remote_cfg.clone()
+    };
+    let (meta_store, meta_path) =
+        build_object_store(&slabs_uri, &meta_cfg).map_err(|e| e.to_string())?;
+    let (directory, zstd_dict, osv_bytes) =
+        rt.block_on(load_osv_metadata(&meta_store, &meta_path))?;
+    Ok((store, obj_path, remote_cfg, directory, zstd_dict, osv_bytes))
+}
+
 fn run_server(
     osi_path: &Path,
     slabs: &str,
@@ -571,17 +602,13 @@ fn run_server(
     let osi = OsiIndex::from_bytes(&mmap).map_err(|e| e.to_string())?;
     let orig_dim = osi.header().orig_dim;
 
-    let slabs_uri = normalize_slabs_uri(slabs)?;
-    let remote_cfg = RemoteStoreConfig::default();
-    let (store, obj_path) =
-        build_object_store(&slabs_uri, &remote_cfg).map_err(|e| e.to_string())?;
-
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
 
-    let (directory, zstd_dict, _osv_bytes) = rt.block_on(load_osv_metadata(&store, &obj_path))?;
+    let (store, obj_path, remote_cfg, directory, zstd_dict, _osv_bytes) =
+        open_remote_osv(slabs, &rt)?;
 
     let range_planner_cfg = if no_coalesce {
         RangePlannerConfig {
@@ -648,17 +675,13 @@ fn run_search_eval(
     let (gt_rows, gt_cols, gt_flat) = load_i64_matrix(gt_npy)?;
     let q_count = num_q.min(gt_rows).min(max_queries);
 
-    let slabs_uri = normalize_slabs_uri(slabs)?;
-    let remote_cfg = RemoteStoreConfig::default();
-    let (store, obj_path) =
-        build_object_store(&slabs_uri, &remote_cfg).map_err(|e| e.to_string())?;
-
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
 
-    let (directory, zstd_dict, osv_bytes) = rt.block_on(load_osv_metadata(&store, &obj_path))?;
+    let (store, obj_path, remote_cfg, directory, zstd_dict, osv_bytes) =
+        open_remote_osv(slabs, &rt)?;
 
     let range_planner_cfg = if no_coalesce {
         RangePlannerConfig {
