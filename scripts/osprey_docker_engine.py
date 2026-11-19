@@ -41,13 +41,16 @@ OSI_MAGIC = b"OSPR"
 OSI_FORMAT_KIND = 1
 OSI_FORMAT_VERSION = 1
 
-# Mirrors `osprey_core::search::SearchOptions::resolve`
+# Mirrors `osprey_core::search::SearchOptions::resolve_for_bits`
 LOW_DIM_OVERSAMPLE_THRESHOLD = 256
 DEFAULT_LOW_DIM_OVERSAMPLE_MULTIPLIER = 2
 LOW_DIM_REFINE_POOL = 128
 LOW_DIM_DEFAULT_CANDIDATES = 2000
 HIGH_DIM_DEFAULT_CANDIDATES = 300
+FOUR_BIT_LOW_DIM_DEFAULT_CANDIDATES = 100
+FOUR_BIT_HIGH_DIM_DEFAULT_CANDIDATES = 40
 MAX_STAGE1_CANDIDATES = 4096
+OSI_FLAG_RABITQ_4BIT = 0x04
 
 
 # ---------------------------------------------------------------------------
@@ -362,23 +365,32 @@ def resolve_search_params(
     refine_m: int,
     top_k: int = 10,
     refine_multiplier: int = 0,
+    bits: int = 1,
 ) -> Dict[str, Any]:
-    """Mirror `osprey_core::search::SearchOptions::resolve` with Stage-1 cap 4096."""
+    """Mirror `osprey_core::search::SearchOptions::resolve_for_bits` with Stage-1 cap 4096."""
     low_dim = int(dim) <= LOW_DIM_OVERSAMPLE_THRESHOLD
+    is_4bit = int(bits) >= 4
     if int(refine_multiplier) == 0:
-        resolved_mult = DEFAULT_LOW_DIM_OVERSAMPLE_MULTIPLIER if low_dim else 1
+        resolved_mult = DEFAULT_LOW_DIM_OVERSAMPLE_MULTIPLIER if (low_dim and not is_4bit) else 1
     else:
         resolved_mult = max(1, int(refine_multiplier))
 
     auto_candidates = int(refine_m) == 0
     if auto_candidates:
-        base_candidates = (
-            LOW_DIM_DEFAULT_CANDIDATES if low_dim else HIGH_DIM_DEFAULT_CANDIDATES
-        )
+        if is_4bit:
+            base_candidates = (
+                FOUR_BIT_LOW_DIM_DEFAULT_CANDIDATES
+                if low_dim
+                else FOUR_BIT_HIGH_DIM_DEFAULT_CANDIDATES
+            )
+        else:
+            base_candidates = (
+                LOW_DIM_DEFAULT_CANDIDATES if low_dim else HIGH_DIM_DEFAULT_CANDIDATES
+            )
     else:
         base_candidates = int(refine_m)
 
-    low_dim_oversample = low_dim and resolved_mult > 1
+    low_dim_oversample = (not is_4bit) and low_dim and resolved_mult > 1
     refine_floor = LOW_DIM_REFINE_POOL if low_dim_oversample else 0
     refine_limit = max(int(top_k), refine_floor)
     effective_candidates = min(base_candidates * resolved_mult, MAX_STAGE1_CANDIDATES)
@@ -488,6 +500,7 @@ class OspreyDockerServerEngine:
         self.client: Optional[httpx.Client] = None
         self.fwht_seed: Optional[int] = None
         self.osi_meta: Optional[Dict[str, Any]] = None
+        self.bits: int = 1
         self.load_time_s = 0.0
         self._rust_http_ok: Optional[bool] = None
         self._warned_httpx_fallback = False
@@ -537,6 +550,7 @@ class OspreyDockerServerEngine:
         osi_path = self.store_dir / "segment.osi"
         self.osi_meta = read_osi_header(osi_path)
         self.fwht_seed = int(self.osi_meta["fwht_seed"])
+        self.bits = 4 if (int(self.osi_meta.get("flags", 0)) & OSI_FLAG_RABITQ_4BIT) != 0 else 1
         return write_cluster_manifest(self.store_dir, osi_path)
 
     def drop_page_cache(self) -> None:
@@ -574,6 +588,7 @@ class OspreyDockerServerEngine:
         if self.fwht_seed is None and (self.store_dir / "segment.osi").exists():
             self.osi_meta = read_osi_header(self.store_dir / "segment.osi")
             self.fwht_seed = int(self.osi_meta["fwht_seed"])
+            self.bits = 4 if (int(self.osi_meta.get("flags", 0)) & OSI_FLAG_RABITQ_4BIT) != 0 else 1
         if not (self.store_dir / "manifest.json").exists() and (
             self.store_dir / "segment.osi"
         ).exists():
@@ -669,7 +684,12 @@ class OspreyDockerServerEngine:
         refine_multiplier: int = 0,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         plan = resolve_search_params(
-            self.dim, nprobe, refine_m, top_k=top_k, refine_multiplier=refine_multiplier
+            self.dim,
+            nprobe,
+            refine_m,
+            top_k=top_k,
+            refine_multiplier=refine_multiplier,
+            bits=self.bits,
         )
         vec = query.tolist() if hasattr(query, "tolist") else list(query)
         payload = {

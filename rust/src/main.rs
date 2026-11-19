@@ -17,6 +17,7 @@ use clap::{Parser, Subcommand};
 use memmap2::Mmap;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
+use osprey_core::format::osv::OSV_FLAG_ZSTD_ENABLED;
 use osprey_core::{
     cast_minipage_directory, AlignedBuffer, MinipageDirectoryEntry, OsiIndex, OsiMappedView,
     OspreyError, OsrStore, OsvHeader, QuantizedQueryLut, SearchOptions,
@@ -248,7 +249,7 @@ async fn handle_server_search(
         rerank_top_m: 0,
         refine_multiplier: req.refine_multiplier,
     }
-    .resolve(state.orig_dim);
+    .resolve_for_bits(state.orig_dim, state.osi.header().rabitq_bits());
 
     let t0 = Instant::now();
     let osi = Arc::clone(&state.osi);
@@ -490,7 +491,7 @@ fn percentile(sorted: &[f64], p: usize) -> f64 {
 async fn load_osv_metadata(
     store: &Arc<dyn ObjectStore>,
     obj_path: &ObjectPath,
-) -> Result<(Vec<MinipageDirectoryEntry>, Option<Vec<u8>>, u64), String> {
+) -> Result<(Vec<MinipageDirectoryEntry>, Option<Vec<u8>>, u64, bool), String> {
     let meta = store
         .head(obj_path)
         .await
@@ -540,7 +541,12 @@ async fn load_osv_metadata(
     } else {
         Vec::new()
     };
-    Ok((directory, zstd_dict, osv_size))
+    Ok((
+        directory,
+        zstd_dict,
+        osv_size,
+        (hdr.flags & OSV_FLAG_ZSTD_ENABLED) != 0,
+    ))
 }
 
 fn parse_usize_list(s: &str) -> Result<Vec<usize>, String> {
@@ -571,6 +577,7 @@ fn open_remote_osv(
         Vec<MinipageDirectoryEntry>,
         Option<Vec<u8>>,
         u64,
+        bool,
     ),
     String,
 > {
@@ -584,9 +591,17 @@ fn open_remote_osv(
     };
     let (meta_store, meta_path) =
         build_object_store(&slabs_uri, &meta_cfg).map_err(|e| e.to_string())?;
-    let (directory, zstd_dict, osv_bytes) =
+    let (directory, zstd_dict, osv_bytes, zstd_enabled) =
         rt.block_on(load_osv_metadata(&meta_store, &meta_path))?;
-    Ok((store, obj_path, remote_cfg, directory, zstd_dict, osv_bytes))
+    Ok((
+        store,
+        obj_path,
+        remote_cfg,
+        directory,
+        zstd_dict,
+        osv_bytes,
+        zstd_enabled,
+    ))
 }
 
 fn run_server(
@@ -607,7 +622,7 @@ fn run_server(
         .build()
         .map_err(|e| e.to_string())?;
 
-    let (store, obj_path, remote_cfg, directory, zstd_dict, _osv_bytes) =
+    let (store, obj_path, remote_cfg, directory, zstd_dict, _osv_bytes, zstd_enabled) =
         open_remote_osv(slabs, &rt)?;
 
     let range_planner_cfg = if no_coalesce {
@@ -623,7 +638,9 @@ fn run_server(
     let state = Arc::new(ServerState {
         osi: Arc::new(osi),
         orig_dim,
-        refine_stage: Arc::new(RefineStage::new(0, range_planner_cfg, zstd_dict)),
+        refine_stage: Arc::new(
+            RefineStage::new(0, range_planner_cfg, zstd_dict).with_zstd_enabled(zstd_enabled),
+        ),
         directory,
         cache: Arc::new(MinipageLruCache::new(cache_mb.saturating_mul(1024 * 1024))),
         store,
@@ -680,7 +697,7 @@ fn run_search_eval(
         .build()
         .map_err(|e| e.to_string())?;
 
-    let (store, obj_path, remote_cfg, directory, zstd_dict, osv_bytes) =
+    let (store, obj_path, remote_cfg, directory, zstd_dict, osv_bytes, zstd_enabled) =
         open_remote_osv(slabs, &rt)?;
 
     let range_planner_cfg = if no_coalesce {
@@ -692,7 +709,8 @@ fn run_search_eval(
     } else {
         RangePlannerConfig::default()
     };
-    let refine_stage = RefineStage::new(0, range_planner_cfg, zstd_dict);
+    let refine_stage =
+        RefineStage::new(0, range_planner_cfg, zstd_dict).with_zstd_enabled(zstd_enabled);
     let simd = SimdEngine::new_auto();
 
     let mut results = Vec::new();
@@ -705,7 +723,7 @@ fn run_search_eval(
                 rerank_top_m: 0,
                 refine_multiplier,
             }
-            .resolve(orig_dim);
+            .resolve_for_bits(orig_dim, osi.header().rabitq_bits());
 
             let cache_bytes = cache_mb.saturating_mul(1024 * 1024);
             let cache = MinipageLruCache::new(cache_bytes);

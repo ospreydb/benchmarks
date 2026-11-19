@@ -415,6 +415,7 @@ def main() -> int:
     parser.add_argument("--minio-endpoint", default="http://127.0.0.1:9000")
     parser.add_argument("--bucket", default="osprey-bench")
     parser.add_argument("--clusters", type=int, default=256)
+    parser.add_argument("--bits", type=int, default=1, help="RaBitQ bits per dim (1 or 4)")
     parser.add_argument("--nprobe-list", default="4,8,16,24,32,48")
     parser.add_argument("--refine-list", default="50,100,150,200,300")
     parser.add_argument("--off-nprobe-list", default="16,24,32")
@@ -463,7 +464,8 @@ def main() -> int:
             worker_counts.append(w)
 
     ds_dir = PREP_DIR / args.dataset
-    art_dir = ARTIFACTS_DIR / "pareto" / args.dataset
+    art_tag = f"{args.dataset}_b{args.bits}_k{args.clusters}" if (args.bits != 1 or args.clusters != 256) else args.dataset
+    art_dir = ARTIFACTS_DIR / "pareto" / art_tag
     art_dir.mkdir(parents=True, exist_ok=True)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -484,6 +486,10 @@ def main() -> int:
                 "embedding",
                 "--clusters",
                 str(args.clusters),
+                "--bits",
+                str(args.bits),
+                "--osv-compression",
+                "zstd",
             ],
             check=True,
         )

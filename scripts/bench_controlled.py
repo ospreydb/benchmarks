@@ -2358,10 +2358,11 @@ def _run_osprey_docker_variant(
     osprey_ver: str,
     env_ver: str,
     port: int = OSPREY_DOCKER_PORT,
+    bits: int = 1,
 ) -> List[Dict[str, Any]]:
     """Run production `osprey serve` inside a symmetric Docker container."""
     stop_all_engines()
-    print(f"[controlled] {dataset}: building OspreyDB Docker index ({osprey_ver})")
+    print(f"[controlled] {dataset}: building OspreyDB Docker index ({osprey_ver}, bits={bits})")
     eng = OspreyDockerServerEngine(
         dataset=dataset,
         dim=dim,
@@ -2384,6 +2385,8 @@ def _run_osprey_docker_variant(
             "embedding",
             "--clusters",
             str(clusters),
+            "--bits",
+            str(bits),
             "--json",
         ]
     )
@@ -2429,7 +2432,7 @@ def _run_osprey_docker_variant(
                 dataset,
                 meta,
                 splits,
-                "OspreyDB Server (Docker, WAL+LSM, 1-bit .osi + f16 .osv)",
+                f"OspreyDB Server (Docker, WAL+LSM, {bits}-bit .osi + f16 .osv)",
                 "osprey_docker",
                 transport,
                 target,
@@ -2447,9 +2450,9 @@ def _run_osprey_docker_variant(
                 mem_metric,
                 (
                     f"Production osprey serve --role unified in Docker container ({OSPREY_DOCKER_CONTAINER}); "
-                    "WAL+LSM+CoW compactor active; manifest.json from .osi header; "
-                    "root dd page cache evicted before serve; query peak memory is query-only cgroup memory.peak. "
-                    f"versions=[{osprey_ver} {env_ver}]"
+                    f"WAL+LSM+CoW compactor active; {bits}-bit RaBitQ ({clusters} clusters, uncompressed local .osv mmap); "
+                    "manifest.json from .osi header; root dd page cache evicted before serve; "
+                    f"query peak memory is query-only cgroup memory.peak. versions=[{osprey_ver} {env_ver}]"
                 ),
                 ingest_time_s=0.0,
                 index_build_time_s=build_s,
@@ -2743,15 +2746,27 @@ def run_controlled(args: Any) -> int:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     ensure_compose_services()
 
+    bits = int(getattr(args, "bits", 1) or 1)
+    nprobe_override = str(getattr(args, "nprobe_grid", "") or "").strip()
+    refine_override = str(getattr(args, "refine_grid", "") or "").strip()
+
     nprobe_grid = (
-        ([8, 16, 32, 64, 128] if int(args.clusters) >= 1024 else [8, 16, 32, 64])
-        if not args.quick
-        else [16, 32]
+        [int(x.strip()) for x in nprobe_override.split(",") if x.strip()]
+        if nprobe_override
+        else (
+            ([8, 16, 32, 64, 128] if int(args.clusters) >= 1024 else [8, 16, 32, 64])
+            if not args.quick
+            else [16, 32]
+        )
     )
     refine_grid = (
-        [300, 500, 800, 1000, 1200, 1500, 2000, 2500, 3000, 4000]
-        if not args.quick
-        else [500, 1200]
+        [int(x.strip()) for x in refine_override.split(",") if x.strip()]
+        if refine_override
+        else (
+            [300, 500, 800, 1000, 1200, 1500, 2000, 2500, 3000, 4000]
+            if not args.quick
+            else [500, 1200]
+        )
     )
     ef_grid = (
         [16, 32, 48, 64, 80, 96, 128, 192, 256, 384, 512]
@@ -2774,10 +2789,11 @@ def run_controlled(args: Any) -> int:
         dim = int(meta["dim"])
         low_dim = dim <= 256
         max_stage1 = 4096
+        oversample_mult = 2 if (low_dim and bits < 4) else 1
         refine_grid_ds = [
             r
             for r in refine_grid
-            if r * (2 if low_dim else 1) <= max_stage1
+            if r * oversample_mult <= max_stage1
         ]
         if len(refine_grid_ds) != len(refine_grid):
             print(
@@ -2824,6 +2840,7 @@ def run_controlled(args: Any) -> int:
                     args.runner_bin,
                     osprey_ver,
                     env_ver,
+                    bits=bits,
                 )
             )
 

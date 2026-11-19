@@ -1735,6 +1735,7 @@ dependencies = [
 name = "osprey-simd"
 version = "0.1.1"
 dependencies = [
+ "half",
  "osprey-core",
 ]
 

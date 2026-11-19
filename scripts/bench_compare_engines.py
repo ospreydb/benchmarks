@@ -434,6 +434,17 @@ def main() -> int:
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--osprey-port", type=int, default=18080)
     parser.add_argument("--controlled-cache-mb", type=int, default=256)
+    parser.add_argument("--bits", type=int, default=1, help="RaBitQ bits per coordinate (1 or 4).")
+    parser.add_argument(
+        "--refine-grid",
+        default="",
+        help="Optional comma-separated refine_m calibration grid override.",
+    )
+    parser.add_argument(
+        "--nprobe-grid",
+        default="",
+        help="Optional comma-separated nprobe calibration grid override.",
+    )
     parser.add_argument(
         "--qdrant-on-disk",
         action="store_true",

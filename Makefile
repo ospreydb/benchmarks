@@ -100,6 +100,10 @@ bench-compare-controlled-vldb:
 		--datasets $(COMPARE_DATASETS) \
 		--recall-target 0.95 0.97 \
 		--engines osprey_docker,qdrant_fp32,qdrant_sq8,qdrant_bq,pgvector,pgvector_halfvec,faiss_ivf \
+		--clusters 1024 \
+		--bits 4 \
+		--nprobe-grid 16,32,40,48,64,96,128 \
+		--refine-grid 10,20,40,60,100,200,300 \
 		--workers 16 \
 		--warmup-queries 200 \
 		--measure-queries 1000 \
@@ -130,6 +134,12 @@ bench-lutrank:
 bench-pareto:
 	$(PYTHON) $(CURDIR)/scripts/bench_pareto_s3.py \
 		--dataset $(PARETO_DATASET) \
+		--clusters 1024 \
+		--bits 4 \
+		--nprobe-list 32,40,48,64 \
+		--refine-list 10,20,30,40 \
+		--off-nprobe-list 40,48,64 \
+		--off-refine-list 20,30,40 \
 		--osprey-bin $(OSPREY_BIN) \
 		--runner-bin $(RUNNER_BIN)
 
