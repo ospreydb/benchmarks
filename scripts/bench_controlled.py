@@ -51,6 +51,41 @@ from qdrant_client.models import (
     VectorParams,
 )
 
+try:
+    from osprey_docker_engine import (
+        OSPREY_DOCKER_CONTAINER,
+        OSPREY_DOCKER_PORT,
+        OspreyDockerServerEngine,
+        container_max_vmhwm_kb,
+        container_peak_memory_kb,
+        container_pids,
+        dir_size_mb,
+        drop_docker_dir_page_cache,
+        read_vmhwm_kb,
+        run_rust_http_load,
+        start_container,
+        stop_container,
+        stop_osprey_docker_container,
+        wait_http,
+    )
+except ImportError:
+    from scripts.osprey_docker_engine import (
+        OSPREY_DOCKER_CONTAINER,
+        OSPREY_DOCKER_PORT,
+        OspreyDockerServerEngine,
+        container_max_vmhwm_kb,
+        container_peak_memory_kb,
+        container_pids,
+        dir_size_mb,
+        drop_docker_dir_page_cache,
+        read_vmhwm_kb,
+        run_rust_http_load,
+        start_container,
+        stop_container,
+        stop_osprey_docker_container,
+        wait_http,
+    )
+
 ROOT = Path(__file__).resolve().parent.parent
 PREP_DIR = ROOT / "datasets" / "prepared"
 ARTIFACTS_DIR = ROOT / "artifacts" / "controlled"
@@ -137,53 +172,6 @@ def bootstrap_recall_ci95(
         boot_means[start : start + b] = per_q[idx].mean(axis=1)
     low, high = np.percentile(boot_means, [2.5, 97.5])
     return float(low), float(high)
-
-
-def dir_size_mb(path: Path) -> float:
-    """Measure allocated on-disk bytes (`st_blocks * 512`) to avoid overcounting sparse holes."""
-    if not path.exists():
-        return 0.0
-    total = 0
-    for p in path.rglob("*"):
-        if p.is_file():
-            try:
-                st = p.stat()
-                total += st.st_blocks * 512 if hasattr(st, "st_blocks") else st.st_size
-            except OSError:
-                pass
-    return total / (1024.0 * 1024.0)
-
-
-def read_vmhwm_kb(pid: int) -> int:
-    try:
-        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
-            if line.startswith("VmHWM:"):
-                return int(line.split()[1])
-    except (OSError, ValueError, IndexError):
-        pass
-    return 0
-
-
-def container_pids(name: str) -> List[int]:
-    try:
-        out = subprocess.check_output(
-            ["docker", "top", name, "-eo", "pid"],
-            text=True,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-        )
-    except (subprocess.SubprocessError, OSError):
-        return []
-    pids: List[int] = []
-    for line in out.splitlines()[1:]:
-        line = line.strip()
-        if line.isdigit():
-            pids.append(int(line))
-    return pids
-
-
-def container_max_vmhwm_kb(name: str) -> int:
-    return max((read_vmhwm_kb(pid) for pid in container_pids(name)), default=0)
 
 
 _SYSTEMD_SCOPE_OK: Optional[bool] = None
@@ -276,43 +264,67 @@ def drop_path_page_cache(target: Path) -> None:
             )
 
 
-def run_rust_http_load(
+def runner_supports_pg_load(runner_bin: str) -> bool:
+    """Probe whether `runner_bin` supports the `pg-load` subcommand."""
+    if not runner_bin:
+        return False
+    try:
+        proc = subprocess.run(
+            [runner_bin, "pg-load", "--help"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+        return proc.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def run_rust_pg_load(
     runner_bin: str,
-    url: str,
-    engine: str,
-    payloads: Sequence[bytes],
+    dsn: str,
+    table: str,
+    col_type: str,
+    ef_search: int,
+    q_literals: Sequence[str],
     workers: int,
-    warmup_payloads: Optional[Sequence[bytes]] = None,
+    warmup_q_literals: Optional[Sequence[str]] = None,
+    limit: int = 10,
 ) -> Tuple[List[List[int]], List[float], List[float], float]:
-    """Run sequential (workers=1) or concurrent (workers=N) HTTP load via Rust."""
-    with tempfile.TemporaryDirectory(prefix="osprey_http_load_") as tmp_dir:
+    """Run sequential (workers=1) or concurrent (workers=N) pgvector SQL load via Rust."""
+    with tempfile.TemporaryDirectory(prefix="osprey_pg_load_") as tmp_dir:
         tmp_path = Path(tmp_dir)
-        payload_path = tmp_path / f"http_load_{engine}.jsonl"
-        out_path = tmp_path / f"http_load_{engine}_out.json"
-        with open(payload_path, "wb") as fh:
-            for p in payloads:
-                fh.write(p)
-                fh.write(b"\n")
+        payload_path = tmp_path / "pg_load_payloads.txt"
+        out_path = tmp_path / "pg_load_out.json"
+        payload_path.write_text(
+            "".join(f"{q}\n" for q in q_literals), encoding="utf-8"
+        )
         cmd = [
             runner_bin,
-            "http-load",
-            "--url",
-            url,
-            "--engine",
-            engine,
+            "pg-load",
+            "--dsn",
+            dsn,
+            "--table",
+            table,
+            "--col-type",
+            col_type,
+            "--ef-search",
+            str(int(ef_search)),
+            "--limit",
+            str(int(limit)),
             "--payloads-file",
             str(payload_path),
             "--workers",
-            str(workers),
+            str(int(workers)),
             "--out-json",
             str(out_path),
         ]
-        if warmup_payloads:
-            warmup_path = tmp_path / f"http_load_{engine}_warmup.jsonl"
-            with open(warmup_path, "wb") as fh:
-                for p in warmup_payloads:
-                    fh.write(p)
-                    fh.write(b"\n")
+        if warmup_q_literals:
+            warmup_path = tmp_path / "pg_load_warmup.txt"
+            warmup_path.write_text(
+                "".join(f"{q}\n" for q in warmup_q_literals), encoding="utf-8"
+            )
             cmd.extend(["--warmup-payloads-file", str(warmup_path)])
         subprocess.run(
             cmd,
@@ -321,41 +333,13 @@ def run_rust_http_load(
             stderr=subprocess.PIPE,
             text=True,
         )
-        report = json.loads(out_path.read_text())
+        report = json.loads(out_path.read_text(encoding="utf-8"))
         return (
             [[int(x) for x in row] for row in report["doc_ids"]],
             [float(x) for x in report["client_ms"]],
-            [float(x) for x in report["server_ms"]],
+            [float(x) for x in report.get("server_ms", [])],
             float(report["wall_s"]),
         )
-
-
-def container_peak_memory_kb(name: str) -> int:
-    """Peak cgroup memory for a container, including its page cache.
-
-    Process ``VmHWM`` undercounts page-cache resident indexes (notably
-    pgvector). cgroup v2 ``memory.peak`` is the comparable container metric.
-    """
-    try:
-        cid = subprocess.check_output(
-            ["docker", "inspect", "-f", "{{.Id}}", name],
-            text=True,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-        ).strip()
-        candidates = [
-            Path(f"/sys/fs/cgroup/system.slice/docker-{cid}.scope/memory.peak"),
-            Path(f"/sys/fs/cgroup/docker/{cid}/memory.peak"),
-            Path(
-                f"/sys/fs/cgroup/memory/docker/{cid}/memory.max_usage_in_bytes"
-            ),
-        ]
-        for path in candidates:
-            if path.exists():
-                return int(path.read_text().strip()) // 1024
-    except (OSError, ValueError, subprocess.SubprocessError):
-        pass
-    return container_max_vmhwm_kb(name)
 
 
 class RssSampler:
@@ -390,20 +374,6 @@ class RssSampler:
         except Exception:
             pass
         return self.max_kb
-
-
-def wait_http(url: str, timeout: float = 180.0) -> None:
-    deadline = time.time() + timeout
-    last_err: Optional[Exception] = None
-    while time.time() < deadline:
-        try:
-            resp = httpx.get(url, timeout=3.0)
-            if resp.status_code < 500:
-                return
-        except Exception as exc:  # noqa: BLE001 - readiness probe
-            last_err = exc
-        time.sleep(0.5)
-    raise RuntimeError(f"timeout waiting for {url}: {last_err}")
 
 
 _UNIT_SEQ = 0
@@ -493,22 +463,6 @@ def measure_cmd_peak_rss(
     return elapsed, 0.0
 
 
-def stop_container(name: str) -> None:
-    subprocess.run(
-        ["docker", "stop", name],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-
-def start_container(name: str) -> None:
-    subprocess.run(
-        ["docker", "start", name],
-        check=True,
-        stdout=subprocess.DEVNULL,
-    )
-
-
 def ensure_compose_services() -> None:
     # Create the containers without starting them: each engine must be measured
     # in isolation, so engines are started and stopped around their own stage.
@@ -559,42 +513,7 @@ def stop_all_engines() -> None:
     stop_pgvector()
     stop_qdrant_dedicated_container(QDRANT_BQ_NAME)
     stop_qdrant_dedicated_container(QDRANT_SQ8_NAME)
-
-
-def drop_docker_dir_page_cache(
-    host_dir: Path, image: str, mount_path: str = "/data"
-) -> None:
-    """Evict host page cache on root-owned Docker data directories via `dd iflag=nocache`."""
-    if not host_dir.exists():
-        return
-    proc = subprocess.run(
-        [
-            "docker",
-            "run",
-            "--rm",
-            "--user",
-            "0:0",
-            "-v",
-            f"{host_dir.resolve()}:{mount_path}",
-            "--entrypoint=",
-            image,
-            "sh",
-            "-c",
-            (
-                f"find {mount_path} -type f -exec "
-                "dd if={} of=/dev/null iflag=nocache count=0 status=none \\;"
-            ),
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    if proc.returncode != 0:
-        print(
-            f"  [warn] root container page-cache eviction failed for {host_dir} "
-            f"(exit={proc.returncode}): {proc.stderr.strip()}",
-            flush=True,
-        )
+    stop_osprey_docker_container()
 
 
 def restart_qdrant_fp32() -> None:
@@ -1472,10 +1391,17 @@ class QdrantEngine:
 # pgvector engine
 # ---------------------------------------------------------------------------
 class PgvectorEngine:
-    def __init__(self, dataset: str, dim: int, variant: str = "pgvector"):
+    def __init__(
+        self,
+        dataset: str,
+        dim: int,
+        variant: str = "pgvector",
+        runner_bin: str = "",
+    ):
         self.dataset = dataset
         self.dim = dim
         self.variant = variant
+        self.runner_bin = runner_bin
         self.col_type = "halfvec" if variant == "pgvector_halfvec" else "vector"
         self.ops_class = (
             "halfvec_cosine_ops"
@@ -1488,6 +1414,12 @@ class PgvectorEngine:
             else f"ctrl_vecs_{dataset}_halfvec"
         )
         self._ef_by_conn: Dict[int, int] = {}
+        self._rust_pg_ok: Optional[bool] = None
+
+    def uses_rust_pg_load(self) -> bool:
+        if self._rust_pg_ok is None:
+            self._rust_pg_ok = runner_supports_pg_load(self.runner_bin)
+        return self._rust_pg_ok
 
     def vmhwm_kb(self) -> int:
         return container_max_vmhwm_kb(PGVECTOR_CONTAINER)
@@ -1592,9 +1524,51 @@ class PgvectorEngine:
         client_ms = [r[1] for r in results if r is not None]
         return ids, client_ms, [], wall_s
 
+    def sequential_prepared(
+        self,
+        q_literals: Sequence[str],
+        ef: int,
+        warmup_q_literals: Optional[Sequence[str]] = None,
+    ) -> Tuple[List[List[int]], List[float], List[float]]:
+        if self.uses_rust_pg_load():
+            ids, client_ms, server_ms, _wall = run_rust_pg_load(
+                self.runner_bin,
+                PGVECTOR_DSN,
+                self.table,
+                self.col_type,
+                ef,
+                q_literals,
+                1,
+                warmup_q_literals=warmup_q_literals,
+            )
+            return ids, client_ms, server_ms
+        ids_out: List[List[int]] = []
+        cms_out: List[float] = []
+        with psycopg.connect(PGVECTOR_DSN, autocommit=True) as conn:
+            for q_literal in q_literals:
+                found, cms, _ = self.query(conn, q_literal, ef)
+                ids_out.append(found)
+                cms_out.append(cms)
+        return ids_out, cms_out, []
+
     def concurrent(
-        self, q_literals: Sequence[str], ef: int, workers: int = 16
+        self,
+        q_literals: Sequence[str],
+        ef: int,
+        workers: int = 16,
+        warmup_q_literals: Optional[Sequence[str]] = None,
     ) -> Tuple[List[List[int]], List[float], List[float], float]:
+        if self.uses_rust_pg_load():
+            return run_rust_pg_load(
+                self.runner_bin,
+                PGVECTOR_DSN,
+                self.table,
+                self.col_type,
+                ef,
+                q_literals,
+                workers,
+                warmup_q_literals=warmup_q_literals,
+            )
         return asyncio.run(self._concurrent(q_literals, ef, workers))
 
     def server_latency_sample(
@@ -1747,11 +1721,12 @@ def select_for_targets(
 
 
 def calibrate_osprey(
-    engine: OspreyHttpEngine,
+    engine: Any,
     queries: np.ndarray,
     gt: np.ndarray,
     nprobe_grid: Sequence[int],
     refine_grid: Sequence[int],
+    label: str = "osprey",
 ) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
     for nprobe in nprobe_grid:
@@ -1768,7 +1743,7 @@ def calibrate_osprey(
             p50, _, _ = latency_stats(latencies)
             recall = recall_at_k(ids, gt)
             print(
-                f"  [calib][osprey] nprobe={nprobe} refine={refine_m} "
+                f"  [calib][{label}] nprobe={nprobe} refine={refine_m} "
                 f"effective={int(meta.get('effective_nprobe', 0))}/"
                 f"{int(meta.get('effective_candidates', 0))} "
                 f"recall={recall:.4f} p50={p50:.3f}ms",
@@ -2295,6 +2270,199 @@ def _run_qdrant_variant(
     return out_rows
 
 
+def _calibrate_and_measure_osprey(
+    engine: Any,
+    splits: Dict[str, Any],
+    targets: Sequence[float],
+    nprobe_grid: Sequence[int],
+    refine_grid_ds: Sequence[int],
+    rounds: int,
+    workers: int,
+    label: str = "osprey",
+) -> Tuple[Dict[float, Dict[str, Any]], Dict[float, Dict[str, Any]]]:
+    print(f"[controlled] calibrating {label}")
+    calib = calibrate_osprey(
+        engine,
+        splits["calib"],
+        splits["calib_gt"],
+        nprobe_grid,
+        refine_grid_ds,
+        label=label,
+    )
+    selected = select_for_targets(
+        calib,
+        targets,
+        cost_fn=lambda r: (
+            r["effective_candidates"],
+            r["effective_nprobe"],
+            r["p50_ms"],
+        ),
+    )
+    for target, cfg in selected.items():
+        print(
+            f"  target={target:.3f} -> requested {cfg['nprobe']}/"
+            f"{cfg['refine_m']} effective {cfg['effective_nprobe']}/"
+            f"{cfg['effective_candidates']} val_recall={cfg['recall']:.4f} "
+            f"status={cfg['status']}"
+        )
+
+    def seq(item: bytes, cfg: Dict[str, Any]):
+        res = engine.query_prepared(item)
+        return res[0], res[1], res[2]
+
+    def seq_batch(
+        items: Sequence[bytes],
+        cfg: Dict[str, Any],
+        warm_items: Optional[Sequence[Any]] = None,
+    ):
+        return engine.sequential_prepared(items, warmup_payloads=warm_items)
+
+    def warm(item: bytes, cfg: Dict[str, Any]):
+        engine.query_prepared(item)
+
+    def conc(
+        items: Sequence[bytes],
+        cfg: Dict[str, Any],
+        nworkers: int,
+        warm_items: Optional[Sequence[Any]] = None,
+    ):
+        return engine.concurrent_prepared(
+            items, nworkers, warmup_payloads=warm_items
+        )
+
+    measured = measure_generic(
+        selected,
+        splits["warmup"],
+        splits["test"],
+        splits["test_gt"],
+        rounds,
+        workers,
+        sequential_fn=seq,
+        warmup_fn=warm,
+        concurrent_fn=conc,
+        prepare_fn=engine.prepare,
+        sequential_batch_fn=seq_batch,
+    )
+    return selected, measured
+
+
+def _run_osprey_docker_variant(
+    dataset: str,
+    ds_dir: Path,
+    meta: Dict[str, Any],
+    dim: int,
+    clusters: int,
+    splits: Dict[str, Any],
+    targets: Sequence[float],
+    nprobe_grid: Sequence[int],
+    refine_grid_ds: Sequence[int],
+    rounds: int,
+    workers: int,
+    osprey_bin: str,
+    runner_bin: str,
+    osprey_ver: str,
+    env_ver: str,
+    port: int = OSPREY_DOCKER_PORT,
+) -> List[Dict[str, Any]]:
+    """Run production `osprey serve` inside a symmetric Docker container."""
+    stop_all_engines()
+    print(f"[controlled] {dataset}: building OspreyDB Docker index ({osprey_ver})")
+    eng = OspreyDockerServerEngine(
+        dataset=dataset,
+        dim=dim,
+        osprey_bin=osprey_bin,
+        runner_bin=runner_bin,
+        port=port,
+    )
+    store_dir, _wal_dir = eng.prepare_data_dir()
+    build_s, build_peak_mb = measure_cmd_peak_rss(
+        [
+            osprey_bin,
+            "import",
+            "--input",
+            str(ds_dir / "base.parquet"),
+            "--output",
+            str(store_dir),
+            "--id-col",
+            "doc_id",
+            "--vec-col",
+            "embedding",
+            "--clusters",
+            str(clusters),
+            "--json",
+        ]
+    )
+    eng.write_manifest()
+    eng.drop_page_cache()
+    print(f"[controlled] {dataset}: starting OspreyDB Docker server on {eng.url}")
+    load_s = eng.start()
+    load_cgroup_kb = eng.cgroup_peak_kb()
+    load_peak_kb = load_cgroup_kb if load_cgroup_kb > 0 else eng.vmhwm_kb()
+    sampler = RssSampler(eng.vmhwm_kb, interval=0.25)
+    sampler.start()
+    try:
+        selected, measured = _calibrate_and_measure_osprey(
+            eng,
+            splits,
+            targets,
+            nprobe_grid,
+            refine_grid_ds,
+            rounds,
+            workers,
+            label="osprey_docker",
+        )
+    finally:
+        query_vmhwm_kb = sampler.stop()
+        query_cgroup_kb = eng.cgroup_peak_kb()
+        eng.stop()
+    use_cgroup = query_cgroup_kb > 0
+    query_peak_kb = query_cgroup_kb if use_cgroup else query_vmhwm_kb
+    mem_metric = (
+        "cgroup v2 memory.peak (query-only)" if use_cgroup else "VmHWM (process)"
+    )
+    disk_mb = eng.disk_mb()
+    transport = (
+        "HTTP Docker bridge (Rust client)"
+        if eng.uses_rust_http_load()
+        else "HTTP Docker bridge (Python httpx fallback)"
+    )
+
+    out_rows: List[Dict[str, Any]] = []
+    for target, stats in measured.items():
+        out_rows.append(
+            build_row(
+                dataset,
+                meta,
+                splits,
+                "OspreyDB Server (Docker, WAL+LSM, 1-bit .osi + f16 .osv)",
+                "osprey_docker",
+                transport,
+                target,
+                selected[target],
+                stats,
+                load_peak_kb,
+                query_peak_kb,
+                query_vmhwm_kb,
+                int(build_peak_mb * 1024),
+                build_s,
+                load_s,
+                disk_mb,
+                rounds,
+                workers,
+                mem_metric,
+                (
+                    f"Production osprey serve --role unified in Docker container ({OSPREY_DOCKER_CONTAINER}); "
+                    "WAL+LSM+CoW compactor active; manifest.json from .osi header; "
+                    "root dd page cache evicted before serve; query peak memory is query-only cgroup memory.peak. "
+                    f"versions=[{osprey_ver} {env_ver}]"
+                ),
+                ingest_time_s=0.0,
+                index_build_time_s=build_s,
+            )
+        )
+    return out_rows
+
+
 def _run_pgvector_variant(
     dataset: str,
     meta: Dict[str, Any],
@@ -2306,6 +2474,7 @@ def _run_pgvector_variant(
     rounds: int,
     workers: int,
     variant: str,
+    runner_bin: str = "",
 ) -> List[Dict[str, Any]]:
     """Run pgvector FP32 or halfvec (FP16) with isolated build vs query cgroups."""
     stop_all_engines()
@@ -2320,7 +2489,16 @@ def _run_pgvector_variant(
         clear_pg_tables()
     except Exception as exc:  # noqa: BLE001 - best-effort cleanup
         print(f"  [warn] could not clear pgvector tables: {exc}")
-    pg = PgvectorEngine(dataset, dim, variant=variant)
+    pg = PgvectorEngine(dataset, dim, variant=variant, runner_bin=runner_bin)
+    use_rust_pg = pg.uses_rust_pg_load()
+    transport = (
+        "SQL Docker bridge (Rust tokio-postgres)"
+        if use_rust_pg
+        else "SQL localhost (psycopg)"
+    )
+    client_note = (
+        "Rust tokio-postgres load client" if use_rust_pg else "psycopg SQL client"
+    )
     ingest_s = 0.0
     index_build_s = 0.0
     try:
@@ -2358,13 +2536,29 @@ def _run_pgvector_variant(
             def warm(item: str, cfg: Dict[str, Any]):
                 pg.query(conn, item, cfg["hnsw_ef_search"])
 
+            def seq_batch(
+                items: Sequence[str],
+                cfg: Dict[str, Any],
+                warm_items: Optional[Sequence[Any]] = None,
+            ):
+                return pg.sequential_prepared(
+                    list(items),
+                    cfg["hnsw_ef_search"],
+                    warmup_q_literals=list(warm_items) if warm_items else None,
+                )
+
             def conc(
                 items: Sequence[str],
                 cfg: Dict[str, Any],
                 nworkers: int,
-                _warm_items: Optional[Sequence[Any]] = None,
+                warm_items: Optional[Sequence[Any]] = None,
             ):
-                return pg.concurrent(list(items), cfg["hnsw_ef_search"], nworkers)
+                return pg.concurrent(
+                    list(items),
+                    cfg["hnsw_ef_search"],
+                    nworkers,
+                    warmup_q_literals=list(warm_items) if warm_items else None,
+                )
 
             measured = measure_generic(
                 selected,
@@ -2380,6 +2574,7 @@ def _run_pgvector_variant(
                 server_latency_fn=lambda cfg: pg.server_latency_sample(
                     test_q, cfg["hnsw_ef_search"], sample=100
                 ),
+                sequential_batch_fn=seq_batch if use_rust_pg else None,
             )
     finally:
         query_vmhwm_kb = sampler.stop()
@@ -2396,7 +2591,7 @@ def _run_pgvector_variant(
                 splits,
                 label,
                 variant,
-                "SQL localhost (psycopg)",
+                transport,
                 target,
                 selected[target],
                 stats,
@@ -2412,7 +2607,8 @@ def _run_pgvector_variant(
                 "cgroup v2 memory.peak (query-only)",
                 (
                     f"PostgreSQL container ({pg.col_type}); HNSW m=16 ef_construction=100; "
-                    "restarted + page cache dropped after build; server time via EXPLAIN ANALYZE (sample=100); "
+                    f"{client_note}; restarted + page cache dropped after build; "
+                    "server time via EXPLAIN ANALYZE (sample=100); "
                     f"query peak memory is query-only cgroup memory.peak incl. page cache. "
                     f"versions=[{pg_ver} {host_env_meta()}]"
                 ),
@@ -2611,6 +2807,27 @@ def run_controlled(args: Any) -> int:
             f"unique_test={splits['unique_test']})"
         )
 
+        if "osprey_docker" in engines:
+            rows.extend(
+                _run_osprey_docker_variant(
+                    dataset,
+                    ds_dir,
+                    meta,
+                    dim,
+                    int(args.clusters),
+                    splits,
+                    targets,
+                    nprobe_grid,
+                    refine_grid_ds,
+                    rounds,
+                    workers,
+                    args.osprey_bin,
+                    args.runner_bin,
+                    osprey_ver,
+                    env_ver,
+                )
+            )
+
         if "osprey" in engines:
             stop_all_engines()
             print(f"[controlled] {dataset}: building OspreyDB index ({osprey_ver})")
@@ -2651,69 +2868,15 @@ def run_controlled(args: Any) -> int:
             sampler = RssSampler(engine.vmhwm_kb, interval=0.25)
             sampler.start()
             try:
-                print(f"[controlled] {dataset}: calibrating OspreyDB")
-                calib = calibrate_osprey(
+                selected, measured = _calibrate_and_measure_osprey(
                     engine,
-                    splits["calib"],
-                    splits["calib_gt"],
+                    splits,
+                    targets,
                     nprobe_grid,
                     refine_grid_ds,
-                )
-                selected = select_for_targets(
-                    calib,
-                    targets,
-                    cost_fn=lambda r: (
-                        r["effective_candidates"],
-                        r["effective_nprobe"],
-                        r["p50_ms"],
-                    ),
-                )
-                for target, cfg in selected.items():
-                    print(
-                        f"  target={target:.3f} -> requested {cfg['nprobe']}/"
-                        f"{cfg['refine_m']} effective {cfg['effective_nprobe']}/"
-                        f"{cfg['effective_candidates']} val_recall={cfg['recall']:.4f} "
-                        f"status={cfg['status']}"
-                    )
-
-                def seq(item: bytes, cfg: Dict[str, Any]):
-                    ids, cms, sms, _meta = engine.query_prepared(item)
-                    return ids, cms, sms
-
-                def seq_batch(
-                    items: Sequence[bytes],
-                    cfg: Dict[str, Any],
-                    warm_items: Optional[Sequence[Any]] = None,
-                ):
-                    return engine.sequential_prepared(
-                        items, warmup_payloads=warm_items
-                    )
-
-                def warm(item: bytes, cfg: Dict[str, Any]):
-                    engine.query_prepared(item)
-
-                def conc(
-                    items: Sequence[bytes],
-                    cfg: Dict[str, Any],
-                    nworkers: int,
-                    warm_items: Optional[Sequence[Any]] = None,
-                ):
-                    return engine.concurrent_prepared(
-                        items, nworkers, warmup_payloads=warm_items
-                    )
-
-                measured = measure_generic(
-                    selected,
-                    splits["warmup"],
-                    splits["test"],
-                    splits["test_gt"],
                     rounds,
                     workers,
-                    sequential_fn=seq,
-                    warmup_fn=warm,
-                    concurrent_fn=conc,
-                    prepare_fn=engine.prepare,
-                    sequential_batch_fn=seq_batch,
+                    label="osprey",
                 )
             finally:
                 query_vmhwm_kb = sampler.stop()
@@ -2794,6 +2957,7 @@ def run_controlled(args: Any) -> int:
                         rounds,
                         workers,
                         pg_variant,
+                        runner_bin=args.runner_bin,
                     )
                 )
 
