@@ -27,6 +27,8 @@ use osprey_storage::{
 };
 use serde::{Deserialize, Serialize};
 
+mod pg_load;
+
 #[derive(Debug, Parser)]
 #[command(name = "osprey-bench-runner")]
 struct Cli {
@@ -101,13 +103,37 @@ enum Cmd {
     HttpLoad {
         #[arg(long)]
         url: String,
-        /// Engine response schema: "osprey" or "qdrant".
+        /// Engine response schema: "osprey", "osprey_server", or "qdrant".
         #[arg(long)]
         engine: String,
         #[arg(long)]
         payloads_file: PathBuf,
         /// Optional warmup-split JSONL payloads used to warm TCP keep-alive connections
         /// without touching the measured test-split payloads.
+        #[arg(long)]
+        warmup_payloads_file: Option<PathBuf>,
+        #[arg(long, default_value_t = 16)]
+        workers: usize,
+        #[arg(long)]
+        out_json: PathBuf,
+    },
+    /// Executes sequential or concurrent PostgreSQL pgvector queries via tokio-postgres without Python client overhead.
+    PgLoad {
+        #[arg(long)]
+        dsn: String,
+        #[arg(long)]
+        table: String,
+        /// Column type: "vector" or "halfvec".
+        #[arg(long, default_value = "vector")]
+        col_type: String,
+        #[arg(long)]
+        ef_search: usize,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Newline-delimited pgvector text literals (e.g. "[0.1,0.2,...]").
+        #[arg(long)]
+        payloads_file: PathBuf,
+        /// Optional warmup-split literals executed on each worker connection before timing.
         #[arg(long)]
         warmup_payloads_file: Option<PathBuf>,
         #[arg(long, default_value_t = 16)]
@@ -1026,12 +1052,19 @@ struct QdrantHttpResp {
     time: f64,
 }
 
+#[derive(Debug, Deserialize)]
+struct OspreyServerHttpResp {
+    result: Vec<QdrantPointResp>,
+    #[serde(default)]
+    time: f64,
+}
+
 #[derive(Debug, Serialize)]
-struct HttpLoadReport {
-    doc_ids: Vec<Vec<u64>>,
-    client_ms: Vec<f64>,
-    server_ms: Vec<f64>,
-    wall_s: f64,
+pub(crate) struct HttpLoadReport {
+    pub(crate) doc_ids: Vec<Vec<u64>>,
+    pub(crate) client_ms: Vec<f64>,
+    pub(crate) server_ms: Vec<f64>,
+    pub(crate) wall_s: f64,
 }
 
 fn parse_http_engine_response(engine: &str, body: &[u8]) -> Result<(Vec<u64>, f64), String> {
@@ -1041,6 +1074,12 @@ fn parse_http_engine_response(engine: &str, body: &[u8]) -> Result<(Vec<u64>, f6
                 serde_json::from_slice(body).map_err(|e| format!("parse osprey json: {e}"))?;
             Ok((parsed.doc_ids, parsed.server_ms))
         }
+        "osprey_server" => {
+            let parsed: OspreyServerHttpResp = serde_json::from_slice(body)
+                .map_err(|e| format!("parse osprey_server json: {e}"))?;
+            let ids = parsed.result.into_iter().map(|p| p.id).collect();
+            Ok((ids, parsed.time * 1000.0))
+        }
         "qdrant" => {
             let parsed: QdrantHttpResp =
                 serde_json::from_slice(body).map_err(|e| format!("parse qdrant json: {e}"))?;
@@ -1048,7 +1087,7 @@ fn parse_http_engine_response(engine: &str, body: &[u8]) -> Result<(Vec<u64>, f6
             Ok((ids, parsed.time * 1000.0))
         }
         other => Err(format!(
-            "unsupported --engine '{other}' (expected osprey or qdrant)"
+            "unsupported --engine '{other}' (expected osprey, osprey_server, or qdrant)"
         )),
     }
 }
@@ -1075,9 +1114,9 @@ fn run_http_load(
     workers: usize,
     out_json: &Path,
 ) -> Result<(), String> {
-    if engine != "osprey" && engine != "qdrant" {
+    if !matches!(engine, "osprey" | "osprey_server" | "qdrant") {
         return Err(format!(
-            "unsupported --engine '{engine}' (expected osprey or qdrant)"
+            "unsupported --engine '{engine}' (expected osprey, osprey_server, or qdrant)"
         ));
     }
     let payloads = load_jsonl_payloads(payloads_file)?;
@@ -1290,12 +1329,49 @@ fn main() -> Result<(), String> {
             workers,
             &out_json,
         ),
+        Cmd::PgLoad {
+            dsn,
+            table,
+            col_type,
+            ef_search,
+            limit,
+            payloads_file,
+            warmup_payloads_file,
+            workers,
+            out_json,
+        } => pg_load::run_pg_load(pg_load::PgLoadConfig {
+            dsn: &dsn,
+            table: &table,
+            col_type: &col_type,
+            ef_search,
+            limit,
+            payloads_file: &payloads_file,
+            warmup_payloads_file: warmup_payloads_file.as_deref(),
+            workers,
+            out_json: &out_json,
+        }),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_osprey_server_response() {
+        let body = br#"{
+            "result": [
+                {"id": 42, "version": 1, "score": 0.991, "payload": null},
+                {"id": 7, "version": 1, "score": 0.875, "payload": {"k": "v"}}
+            ],
+            "status": "ok",
+            "time": 0.00123
+        }"#;
+        let (doc_ids, server_ms) =
+            parse_http_engine_response("osprey_server", body).expect("parse osprey_server");
+        assert_eq!(doc_ids, vec![42, 7]);
+        assert!((server_ms - 1.23).abs() < 1e-9);
+    }
 
     #[test]
     fn parses_candidates_json_by_id_and_position() {
