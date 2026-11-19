@@ -1112,9 +1112,9 @@ class QdrantEngine:
                     type=ScalarType.INT8, always_ram=True
                 )
             )
-        # Defer HNSW indexing during bulk upload (`indexing_threshold=0`), and pin
-        # `default_segment_number=2` so 100k-scale datasets don't fragment into small
-        # unindexed segments below `indexing_threshold`.
+        # Pin `default_segment_number=2` so 100k-scale datasets don't fragment into small
+        # unindexed segments below `indexing_threshold`, and keep `indexing_threshold=20000`
+        # from collection creation so Qdrant reliably builds the HNSW graph.
         rest_client.create_collection(
             collection_name=coll,
             vectors_config=VectorParams(
@@ -1122,7 +1122,7 @@ class QdrantEngine:
             ),
             hnsw_config=HnswConfigDiff(m=16, ef_construct=100),
             optimizers_config=OptimizersConfigDiff(
-                indexing_threshold=0, default_segment_number=2
+                indexing_threshold=20000, default_segment_number=2
             ),
             **kwargs,
         )
@@ -1143,12 +1143,6 @@ class QdrantEngine:
         ingest_s = time.perf_counter() - t_ingest
 
         t_index = time.perf_counter()
-        rest_client.update_collection(
-            collection_name=coll,
-            optimizers_config=OptimizersConfigDiff(
-                indexing_threshold=20000, default_segment_number=2
-            ),
-        )
         self._wait_ready(rest_client, coll, total)
         index_build_s = time.perf_counter() - t_index
         for c in (grpc_client, rest_client):
