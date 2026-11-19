@@ -1,4 +1,4 @@
-# Controlled recall-matched benchmark — 2026-11-18
+# Controlled recall-matched VLDB benchmark — 2026-11-19
 
 Raw data: [`results/compare_engines_controlled.csv`](compare_engines_controlled.csv) · JSON: [`results/compare_engines_controlled.json`](compare_engines_controlled.json).
 Figures: [`fig1_memory_disk_controlled.svg`](figures/fig1_memory_disk_controlled.svg),
@@ -8,113 +8,92 @@ Figures: [`fig1_memory_disk_controlled.svg`](figures/fig1_memory_disk_controlled
 
 ## Protocol
 
-- Host: 12 vCPU, Linux `x86_64` (AVX-512). OspreyDB ran natively inside a dedicated
-  `systemd-run --user --scope` cgroup; Qdrant (`FP32`, `SQ8`, `BQ`) and `pgvector`
-  (`FP32`, `halfvec FP16`) ran in Docker.
-- Datasets: SIFT1M (`1M × 128`, 1500 queries) and Cohere 768d (`100k × 768`,
-  1000 queries). All vectors are L2-normalized, so cosine and inner-product
-  rankings are identical.
-- Targets: `Recall@10` of `0.95` and `0.97`, calibrated on 25% of the query
-  file (375 queries on SIFT1M, 250 on Cohere). A configuration is eligible only
-  when its validation recall reaches the target; the cheapest eligible
-  configuration is selected.
-- Measurement: 200 warmup queries plus every remaining test query, with no
-  repetition, in 3 rounds and 16 concurrent workers. SIFT measured 925 unique
-  test queries; Cohere measured 550.
-- OspreyDB used `--controlled-cache-mb 256` (a bounded 256 MiB cache, which
-  exceeds the total `.osi+.osv` footprint on both SIFT1M at `212.93 MiB` and
-  Cohere 768d at `151.85 MiB`, so the working set fits in cache once warmed).
-  Exactly one engine was active at a time; containers were restarted and Linux
-  host page cache was evicted after index build
-  (`posix_fadvise(POSIX_FADV_DONTNEED)` / `dd iflag=nocache`) so query-stage
-  `cgroup v2 memory.peak` is measured symmetrically for all 6 engines (capturing
-  both process RSS and page-cache-resident index blocks).
-- Serving & ingestion scope: `osprey-bench-runner serve` is a static, read-only
-  HTTP wrapper over prebuilt `.osi`/`.osv` files (not a full transactional
-  multi-tenant database). `build_time_s` mixes local Parquet Rust import
-  (`osprey import`) with Python JSON/text ingestion for Qdrant and `pgvector`.
-- HTTP transport (`osprey_http`, `qdrant_fp32`, `qdrant_sq8`, `qdrant_bq`) uses
-  the compiled Rust `http-load` keep-alive client (`osprey-bench-runner`) with
-  precomputed JSON payloads outside the timed loop; `pgvector` uses Python
-  `psycopg` over localhost SQL rather than the Rust HTTP client, with server
-  execution time sampled via `EXPLAIN ANALYZE` on 100 queries.
+- Host: 12 vCPU, Linux `x86_64` (AVX-512 `avx512_vpopcntdq`). Production `osprey serve --role unified` (with WAL, LSM, and CoW compactor active), Qdrant (`v1.20.2`, `FP32`, `SQ8`, `BQ`, with `indexing_threshold=20000`), and `pgvector` (`v0.8.7` on PostgreSQL `16.16`, `FP32`, `halfvec FP16`) ran in isolated Docker containers; FAISS `IndexIVFFlat` (`faiss==1.16.0`, `nlist=256`) ran in-process.
+- Datasets: SIFT1M (`1M × 128d`, 1,500 queries) and Cohere 768d (`1M × 768d`, 1,000 queries). All vectors are L2-normalized, so cosine and inner-product rankings are identical.
+- Targets: `Recall@10` of `0.95` and `0.97`, calibrated on 25% of the query file (375 queries on SIFT1M, 250 on Cohere). A configuration is eligible when its validation recall reaches the target (falling back to the highest-recall swept configuration labeled `below_target` otherwise); the cheapest eligible configuration is selected.
+- Measurement: 200 warmup queries plus every remaining test query, with no repetition, in 3 rounds and 16 concurrent workers. SIFT1M measured 925 unique test queries; Cohere 768d (1M) measured 550.
+- Memory & cache isolation: OspreyDB used `--controlled-cache-mb 256` (`osprey_docker`). Exactly one engine was active at a time; containers were restarted and Linux host page cache was evicted after index build (`dd iflag=nocache` / `sync`) so query-stage `cgroup v2 memory.peak` is measured symmetrically for all containerized engines (capturing both process RSS and page-cache-resident index blocks); FAISS IVF reports in-process `VmHWM`.
+- Serving, transport & ingestion scope: `osprey_docker` (`osprey serve`) runs over Docker bridge networking driven by the compiled Rust `http-load` keep-alive client (`osprey-bench-runner`), matching Qdrant's Rust `http-load` transport (with `qdrant_bq` evaluated up to `oversampling=30.0`). `pgvector` uses a compiled Rust `tokio-postgres` SQL driver (`pg_load`) over the Docker bridge, with server execution time sampled on 100 queries via `EXPLAIN ANALYZE`. `build_time_s` combines Parquet import (`osprey import`) with client-side batch ingestion + index build for Qdrant and `pgvector`.
 
 ## SIFT1M
 
 | Engine | Target | Config | Val R@10 | Test R@10 | Test >= target | P50 client seq (ms) | P50 client conc (ms) | P50 server seq/conc (ms) | P95 seq (ms) | P99 seq (ms) | QPS 16w |
 | :--- | ---: | :--- | ---: | ---: | :---: | ---: | ---: | :---: | ---: | ---: | ---: |
-| OspreyDB (1-bit .osi + f16 .osv) | 0.95 | 16/1500 -> 32/3000 | 0.9531 | 0.9641 | yes | 2.775 | 10.854 | 2.712 / 10.094 | 3.175 | 3.388 | 1452.4 |
-| OspreyDB (1-bit .osi + f16 .osv) | 0.97 | 16/2000 -> 32/4000 | 0.9680 | 0.9738 | yes | 3.223 | 13.004 | 3.158 / 12.034 | 3.716 | 3.926 | 1236.9 |
-| Qdrant HNSW FP32 | 0.95 | ef=32 | 0.9683 | 0.9686 | yes | 0.448 | 2.052 | 0.299 / 1.243 | 1.246 | 2.521 | 7014.9 |
-| Qdrant HNSW FP32 | 0.97 | ef=64 | 0.9909 | 0.9903 | yes | 0.454 | 2.640 | 0.304 / 1.728 | 1.225 | 2.497 | 5424.7 |
-| Qdrant int8 SQ8 + rescore | 0.95 | ef=32, os=1.0 | 0.9515 | 0.9579 | yes | 0.209 | 0.823 | 0.098 / 0.397 | 0.250 | 0.313 | 17480.5 |
-| Qdrant int8 SQ8 + rescore | 0.97 | ef=64, os=1.0 | 0.9829 | 0.9837 | yes | 0.246 | 1.046 | 0.129 / 0.560 | 0.290 | 0.311 | 14459.5 |
-| Qdrant 1-bit BQ + rescore | 0.95 | ef=384, os=3.0 | 0.0643 | 0.0666 | **no** | 1.077 | 4.251 | 0.938 / 3.425 | 1.273 | 1.377 | 3427.1 |
-| Qdrant 1-bit BQ + rescore | 0.97 | ef=384, os=3.0 | 0.0643 | 0.0666 | **no** | 1.084 | 4.314 | 0.940 / 3.412 | 1.265 | 1.336 | 3420.7 |
-| pgvector HNSW FP32 | 0.95 | ef_search=64 | 0.9621 | 0.9736 | yes | 2.618 | 8.045 | 2.243 / n/a | 3.154 | 3.465 | 1777.5 |
-| pgvector HNSW FP32 | 0.97 | ef_search=96 | 0.9835 | 0.9866 | yes | 3.575 | 11.188 | 3.047 / n/a | 4.379 | 4.677 | 1302.5 |
-| pgvector halfvec FP16 | 0.95 | ef_search=64 | 0.9587 | 0.9669 | yes | 2.369 | 7.223 | 2.032 / n/a | 2.883 | 3.107 | 1950.6 |
-| pgvector halfvec FP16 | 0.97 | ef_search=96 | 0.9749 | 0.9815 | yes | 3.234 | 10.118 | 2.914 / n/a | 3.952 | 4.211 | 1444.7 |
+| OspreyDB (Docker, 1-bit .osi + f16 .osv) | 0.95 | 16/1500 -> 32/3000 | 0.9531 | 0.9641 | yes | 6.827 | 63.257 | 6.695 / 61.931 | 9.586 | 10.229 | 243.0 |
+| OspreyDB (Docker, 1-bit .osi + f16 .osv) | 0.97 | 16/2000 -> 32/4000 | 0.9680 | 0.9738 | yes | 8.293 | 78.499 | 8.159 / 77.247 | 11.808 | 12.836 | 197.9 |
+| Qdrant HNSW FP32 | 0.95 | ef=256 | 0.9531 | 0.9524 | yes | 0.532 | 1.957 | 0.413 / 1.324 | 0.646 | 0.723 | 7548.4 |
+| Qdrant HNSW FP32 | 0.97 | ef=512 | 0.9672 | 0.9625 | **no** | 0.834 | 3.298 | 0.711 / 2.397 | 0.998 | 1.092 | 4521.8 |
+| Qdrant int8 SQ8 + rescore | 0.95 | ef=64, os=2.0 | 0.9568 | 0.9637 | yes | 0.221 | 0.712 | 0.114 / 0.327 | 0.254 | 0.283 | 20835.7 |
+| Qdrant int8 SQ8 + rescore | 0.97 | ef=16, os=10.0 | 0.9784 | 0.9852 | yes | 0.267 | 0.841 | 0.152 / 0.434 | 0.310 | 0.345 | 17974.7 |
+| Qdrant 1-bit BQ + rescore | 0.95 | ef=384, os=30.0 | 0.0915 | 0.0962 | **no** | 0.495 | 1.576 | 0.382 / 0.990 | 0.598 | 0.658 | 9378.1 |
+| Qdrant 1-bit BQ + rescore | 0.97 | ef=384, os=30.0 | 0.0915 | 0.0962 | **no** | 0.504 | 1.548 | 0.383 / 0.981 | 0.603 | 0.657 | 9653.4 |
+| pgvector HNSW FP32 | 0.95 | ef_search=64 | 0.9605 | 0.9720 | yes | 0.817 | 1.906 | 0.808 / n/a | 1.044 | 1.861 | 6513.4 |
+| pgvector HNSW FP32 | 0.97 | ef_search=80 | 0.9720 | 0.9811 | yes | 0.965 | 2.190 | 0.925 / n/a | 1.242 | 1.995 | 5809.9 |
+| pgvector halfvec FP16 | 0.95 | ef_search=64 | 0.9613 | 0.9663 | yes | 0.724 | 1.604 | 0.616 / n/a | 0.923 | 1.586 | 8295.5 |
+| pgvector halfvec FP16 | 0.97 | ef_search=80 | 0.9715 | 0.9759 | yes | 0.838 | 1.794 | 0.717 / n/a | 1.124 | 1.649 | 7373.1 |
+| FAISS IVF-Flat | 0.95 | nlist=256, nprobe=16 | 0.9784 | 0.9865 | yes | 0.639 | 6.889 | 0.639 / 6.889 | 0.769 | 0.815 | 1938.9 |
+| FAISS IVF-Flat | 0.97 | nlist=256, nprobe=16 | 0.9784 | 0.9865 | yes | 0.635 | 6.834 | 0.635 / 6.834 | 0.764 | 0.816 | 1928.3 |
 
 | Engine | Peak memory (MiB) | Process VmHWM (MiB) | Build peak (MiB) | Disk (MiB) | Build (s) |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| OspreyDB (1-bit .osi + f16 .osv) | 642.3 | 466.2 | 4329.2 | 212.93 | 16.955 |
-| Qdrant HNSW FP32 | 911.9 | 931.4 | 2801.2 | 611.45 | 259.334 |
-| Qdrant int8 SQ8 + rescore | 1389.2 | 1352.6 | 3514.3 | 736.88 | 78.824 |
-| Qdrant 1-bit BQ + rescore | 1152.9 | 1158.4 | 3418.0 | 744.86 | 71.536 |
-| pgvector HNSW FP32 | 1511.8 | 150.0 | 3282.9 | 1361.49 | 379.517 |
-| pgvector halfvec FP16 | 838.1 | 147.1 | 2392.2 | 847.05 | 148.565 |
+| OspreyDB (Docker, 1-bit .osi + f16 .osv) | 1072.2 | 844.5 | 648.7 | 212.95 | 16.905 |
+| Qdrant HNSW FP32 | 1483.2 | 1477.6 | 2656.1 | 1122.95 | 48.356 |
+| Qdrant int8 SQ8 + rescore | 1916.0 | 1911.7 | 3108.9 | 1422.52 | 73.970 |
+| Qdrant 1-bit BQ + rescore | 1654.9 | 1626.8 | 3670.4 | 1204.86 | 127.030 |
+| pgvector HNSW FP32 | 1927.9 | 912.6 | 4877.0 | 1361.80 | 197.391 |
+| pgvector halfvec FP16 | 1406.9 | 661.7 | 4176.4 | 847.09 | 87.932 |
+| FAISS IVF-Flat | 1399.7 | 1399.7 | 1398.9 | 0.00 | 0.437 |
 
-## Cohere 768d (100k)
+## Cohere 768d (1M)
 
 | Engine | Target | Config | Val R@10 | Test R@10 | Test >= target | P50 client seq (ms) | P50 client conc (ms) | P50 server seq/conc (ms) | P95 seq (ms) | P99 seq (ms) | QPS 16w |
 | :--- | ---: | :--- | ---: | ---: | :---: | ---: | ---: | :---: | ---: | ---: | ---: |
-| OspreyDB (1-bit .osi + f16 .osv) | 0.95 | 32/300 -> 32/300 | 0.9684 | 0.9669 | yes | 0.602 | 1.506 | 0.544 / 1.104 | 0.757 | 0.814 | 9960.0 |
-| OspreyDB (1-bit .osi + f16 .osv) | 0.97 | 64/300 -> 64/300 | 0.9864 | 0.9889 | yes | 0.777 | 1.915 | 0.717 / 1.455 | 1.014 | 1.071 | 8022.3 |
-| Qdrant HNSW FP32 | 0.95 | ef=64 | 0.9728 | 0.9664 | yes | 2.762 | 34.650 | 2.489 / 28.685 | 2.996 | 3.107 | 427.4 |
-| Qdrant HNSW FP32 | 0.97 | ef=64 | 0.9728 | 0.9664 | **no** | 2.756 | 34.163 | 2.483 / 29.253 | 2.965 | 3.094 | 432.8 |
-| Qdrant int8 SQ8 + rescore | 0.95 | ef=64, os=1.0 | 0.9616 | 0.9638 | yes | 2.880 | 34.732 | 2.616 / 29.125 | 3.099 | 3.177 | 431.7 |
-| Qdrant int8 SQ8 + rescore | 0.97 | ef=96, os=1.0 | 0.9700 | 0.9727 | yes | 2.891 | 34.908 | 2.623 / 29.532 | 3.112 | 3.227 | 429.6 |
-| Qdrant 1-bit BQ + rescore | 0.95 | ef=512, os=3.0 | 0.9288 | 0.9173 | **no** | 0.551 | 3.052 | 0.395 / 2.182 | 0.663 | 0.719 | 4843.7 |
-| Qdrant 1-bit BQ + rescore | 0.97 | ef=512, os=3.0 | 0.9288 | 0.9173 | **no** | 0.562 | 2.982 | 0.403 / 2.138 | 0.686 | 0.724 | 4701.6 |
-| pgvector HNSW FP32 | 0.95 | ef_search=32 | 0.9508 | 0.9409 | **no** | 1.196 | 3.779 | 1.162 / n/a | 1.511 | 1.814 | 3750.8 |
-| pgvector HNSW FP32 | 0.97 | ef_search=64 | 0.9784 | 0.9773 | yes | 1.949 | 5.976 | 1.972 / n/a | 2.435 | 2.694 | 2310.6 |
-| pgvector halfvec FP16 | 0.95 | ef_search=32 | 0.9512 | 0.9420 | **no** | 0.783 | 2.281 | 0.686 / n/a | 0.956 | 1.109 | 6147.6 |
-| pgvector halfvec FP16 | 0.97 | ef_search=64 | 0.9732 | 0.9747 | yes | 1.220 | 3.505 | 1.121 / n/a | 1.522 | 1.715 | 4042.9 |
+| OspreyDB (Docker, 1-bit .osi + f16 .osv) | 0.95 | 32/300 -> 32/300 | 0.9720 | 0.9620 | yes | 4.378 | 21.367 | 4.242 / 20.560 | 4.962 | 5.172 | 671.1 |
+| OspreyDB (Docker, 1-bit .osi + f16 .osv) | 0.97 | 32/300 -> 32/300 | 0.9720 | 0.9620 | **no** | 4.364 | 20.863 | 4.227 / 19.697 | 4.947 | 5.261 | 676.7 |
+| Qdrant HNSW FP32 | 0.95 | ef=80 | 0.9544 | 0.9429 | **no** | 2.828 | 26.991 | 2.577 / 23.107 | 3.216 | 3.415 | 545.7 |
+| Qdrant HNSW FP32 | 0.97 | ef=192 | 0.9716 | 0.9651 | **no** | 3.246 | 32.288 | 2.959 / 28.442 | 3.666 | 3.851 | 457.4 |
+| Qdrant int8 SQ8 + rescore | 0.95 | ef=96, os=1.0 | 0.9548 | 0.9449 | **no** | 4.699 | 36.937 | 4.299 / 32.618 | 5.074 | 5.264 | 417.0 |
+| Qdrant int8 SQ8 + rescore | 0.97 | ef=256, os=1.0 | 0.9720 | 0.9678 | **no** | 4.797 | 38.060 | 4.391 / 33.608 | 5.296 | 5.599 | 406.4 |
+| Qdrant 1-bit BQ + rescore | 0.95 | ef=16, os=20.0 | 0.9692 | 0.9658 | yes | 0.805 | 3.027 | 0.641 / 2.155 | 0.963 | 1.026 | 4870.3 |
+| Qdrant 1-bit BQ + rescore | 0.97 | ef=16, os=30.0 | 0.9772 | 0.9762 | yes | 0.849 | 3.496 | 0.678 / 2.446 | 1.089 | 1.137 | 4212.1 |
+| pgvector HNSW FP32 | 0.95 | ef_search=48 | 0.9520 | 0.9418 | **no** | 1.750 | 5.862 | 2.063 / n/a | 2.880 | 4.074 | 2351.1 |
+| pgvector HNSW FP32 | 0.97 | ef_search=80 | 0.9704 | 0.9593 | **no** | 2.485 | 7.960 | 2.684 / n/a | 3.608 | 5.572 | 1757.2 |
+| pgvector halfvec FP16 | 0.95 | ef_search=64 | 0.9564 | 0.9496 | **no** | 1.330 | 4.407 | 1.369 / n/a | 2.113 | 3.365 | 3038.9 |
+| pgvector halfvec FP16 | 0.97 | ef_search=96 | 0.9708 | 0.9615 | **no** | 1.741 | 5.334 | 1.695 / n/a | 2.475 | 4.506 | 2505.4 |
+| FAISS IVF-Flat | 0.95 | nlist=256, nprobe=16 | 0.9624 | 0.9404 | **no** | 5.186 | 46.228 | 5.186 / 46.228 | 6.198 | 6.571 | 289.7 |
+| FAISS IVF-Flat | 0.97 | nlist=256, nprobe=32 | 0.9872 | 0.9787 | yes | 10.229 | 91.254 | 10.229 / 91.254 | 11.592 | 12.212 | 147.7 |
 
 | Engine | Peak memory (MiB) | Process VmHWM (MiB) | Build peak (MiB) | Disk (MiB) | Build (s) |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| OspreyDB (1-bit .osi + f16 .osv) | 387.0 | 258.2 | 4329.2 | 151.85 | 19.425 |
-| Qdrant HNSW FP32 | 1435.5 | 1584.7 | 2215.9 | 799.37 | 50.502 |
-| Qdrant int8 SQ8 + rescore | 1461.8 | 1599.2 | 2710.1 | 750.42 | 38.097 |
-| Qdrant 1-bit BQ + rescore | 819.3 | 840.1 | 2353.7 | 557.70 | 52.139 |
-| pgvector HNSW FP32 | 662.9 | 147.3 | 1684.5 | 793.87 | 67.775 |
-| pgvector halfvec FP16 | 450.5 | 147.1 | 1700.7 | 354.04 | 34.030 |
+| OspreyDB (Docker, 1-bit .osi + f16 .osv) | 2080.4 | 557.6 | 3782.9 | 1514.17 | 184.307 |
+| Qdrant HNSW FP32 | 6496.2 | 5826.9 | 8587.5 | 6002.80 | 1133.565 |
+| Qdrant int8 SQ8 + rescore | 6450.6 | 6001.0 | 10902.5 | 5841.70 | 1080.501 |
+| Qdrant 1-bit BQ + rescore | 4851.4 | 4190.2 | 7048.4 | 4455.00 | 773.940 |
+| pgvector HNSW FP32 | 6306.9 | 2098.7 | 14388.2 | 7935.14 | 1656.009 |
+| pgvector halfvec FP16 | 4248.8 | 2064.5 | 9422.7 | 3537.39 | 580.417 |
+| FAISS IVF-Flat | 6998.1 | 6998.1 | 6997.7 | 0.00 | 6.799 |
 
 ## Analysis
 
-### What changed with the symmetric harness
+### What changed at full 1M × 768d VLDB scale
 
-- **Symmetric `cgroup v2 memory.peak` (query-only):** Every engine (including OspreyDB inside `systemd-run --user --scope`) is restarted after build, host page cache is evicted, and query-stage memory is read from `memory.peak`. Both process RSS (`process_vmhwm_mb`) and cgroup peak (`query_peak_rss_mb`) are exported.
-- **Build peak RSS caveat (`4,329.2 MiB`):** OspreyDB's `4,329.2 MiB` `Build peak (MiB)` figure in the tables above is a known `systemd-run` cgroup-scope startup latch artifact; actual `osprey import` peak RSS recorded in [`results/compare_engines.csv`](compare_engines.csv) is `431.5 MiB` on SIFT1M and `691.4 MiB` on Cohere 768d.
-- **Cache sizing & harness scope:** `--controlled-cache-mb 256` exceeds the `.osv` (and total `.osi+.osv`) file size on both `1M×128d` (`212.93 MiB`) and `100k×768d` (`151.85 MiB`). Additionally, `osprey-bench-runner serve` is a static read-only HTTP wrapper, `build_time_s` compares local Rust Parquet import against Python JSON/text ingestion for Qdrant/`pgvector`, and `pgvector` used Python `psycopg` rather than the Rust HTTP client.
-- **Rust `http-load` client:** Removing Python `httpx` client queueing reveals true server-side HTTP throughput (`9,960 QPS` for OspreyDB on Cohere 768d and `17,481 QPS` for Qdrant SQ8 on SIFT1M).
-- **Quantized competitor baselines (`Qdrant SQ8` and `pgvector halfvec`):** Both quantized competitors are included directly alongside FP32 and 1-bit BQ.
+- **Production `osprey_docker` server & Rust `tokio-postgres`:** OspreyDB now runs as its full containerized production server (`osprey serve --role unified` with WAL + LSM + CoW compactor active), and `pgvector` uses the compiled Rust `tokio-postgres` load client instead of Python `psycopg`.
+- **Both benchmarks run at full 1M scale:** Both SIFT1M (`1M × 128d`) and Cohere (`1M × 768d`, `makneeee/cohere_medium_1m`) evaluate 1,000,000 vectors. With `indexing_threshold=20000`, Qdrant builds HNSW indexes cleanly across every collection.
+- **Note on `pgvector` sampled `EXPLAIN ANALYZE` server latency:** For `pgvector`, `server_p50_ms_median` samples `EXPLAIN (ANALYZE, FORMAT JSON)` on 100 queries, whereas `p50_ms_median` measures all 550 test queries with prepared Rust `tokio-postgres` statements; instrumentation overhead in `EXPLAIN ANALYZE` can slightly exceed the prepared client P50 (`2.063 ms` vs `1.750 ms` on Cohere `ef_search=48`).
 
 ### SIFT1M
 
-- **Footprint & build speed:** OspreyDB leads all 6 engines in query peak memory (`642.3 MiB` cgroup peak / `466.2 MiB` `VmHWM`), disk (`212.93 MiB`), and build time (`16.955 s`). It uses **2.4× less query RAM** than `pgvector` FP32 (`1,511.8 MiB`), **2.2× less** than Qdrant SQ8 (`1,389.2 MiB`), **1.4× less** than Qdrant FP32 (`911.9 MiB`), and **1.3× less** than `pgvector halfvec` (`838.1 MiB`), while building **4.6×–22.4× faster** than every competitor.
-- **Latency & QPS:** Qdrant SQ8 (`0.209 / 0.246 ms` P50, `17,481 / 14,460 QPS`) and Qdrant FP32 (`0.448 / 0.454 ms` P50, `7,015 / 5,425 QPS`) lead latency on 128d SIFT. OspreyDB matches `pgvector` FP32 (`2.775 / 3.223 ms` vs `2.618 / 3.575 ms`) and `pgvector halfvec` (`2.369 / 3.234 ms`) at roughly half the disk and memory.
-- **Qdrant 1-bit BQ:** Collapses to `0.0666` test recall (`ef=384, oversampling=3.0`) because SIFT1M descriptors are non-negative ($\mathbb{R}_{\ge 0}^{128}$).
+- **Lowest footprint and Docker build time:** OspreyDB uses the lowest query peak memory (**1,072.2 MiB** cgroup peak / **844.5 MiB** `VmHWM`), disk (**212.95 MiB**), and Docker build time (**16.905 s**), saving **1.3×–1.8× RAM** and **4.0×–6.7× disk** compared to Qdrant and `pgvector`, while building **2.9×–11.7× faster** than containerized competitors (FAISS IVF builds in-process in `0.437 s`).
+- **Throughput & latency trade-off:** On 128d SIFT1M, Qdrant SQ8 (`0.221 / 0.267 ms`, `20,836 / 17,975 QPS`) and `pgvector halfvec` (`0.724 / 0.838 ms`, `8,296 / 7,373 QPS`) lead in latency and QPS, whereas OspreyDB achieves `0.9641 / 0.9738` test recall at `6.827 / 8.293 ms` (`243.0 / 197.9 QPS`) with a 213 MiB disk footprint.
+- **Qdrant 1-bit BQ:** Collapses to `0.0962` test recall even at `ef=384, oversampling=30.0` because SIFT1M descriptors are non-negative ($\mathbb{R}_{\ge 0}^{128}$).
 
-### Cohere 768d (100k)
+### Cohere 768d (1M)
 
-- **Only engine meeting both targets:** OspreyDB reaches `0.9669` at target `0.95` and `0.9889` at target `0.97`, delivering sub-millisecond sequential P50 (`0.602 / 0.777 ms`) and the highest concurrent throughput (`9,960.0 / 8,022.3 QPS`).
-- **Lowest memory, disk, and build time:** OspreyDB uses `387.0 MiB` cgroup peak (`258.2 MiB` `VmHWM`) and `151.85 MiB` disk, compared to `1,435.5 MiB` / `799.37 MiB` for Qdrant FP32 (**3.7×** RAM, **5.3×** disk), `1,461.8 MiB` / `750.42 MiB` for Qdrant SQ8 (**3.8×** RAM, **4.9×** disk), `662.9 MiB` / `793.87 MiB` for `pgvector` FP32 (**1.7×** RAM, **5.2×** disk), and `450.5 MiB` / `354.04 MiB` for `pgvector halfvec` (**1.2×** RAM, **2.3×** disk).
-- **Qdrant FP32/SQ8 & BQ caveats on Cohere 768d:** Qdrant FP32 and SQ8 exhibited an anomalous `~430 QPS` plateau (`2.76–2.89 ms` sequential P50, flat across `ef=64` and `ef=96`) likely due to segment fragmentation or indexing threshold behavior on `100k×768d`, whereas Qdrant BQ reached `4,844 QPS` (`0.551 ms` P50) on the same dataset (and was capped at `oversampling=3.0` = 30 rescore candidates vs. OspreyDB's 300). Meanwhile, `pgvector halfvec` keeps its compact `354 MiB` FP16 index warm (`0.783 / 1.220 ms`, `6,148 / 4,043 QPS`, though its `0.95` calibration `ef_search=32` misses slightly on test at `0.9420`).
+- **3.1× less RAM, 4.0×–5.2× less disk:** On 1M 768d embeddings, OspreyDB uses **2,080.4 MiB** cgroup peak (**557.6 MiB** process `VmHWM`) and **1,514.17 MiB** disk, compared to **6,496.2 MiB** / **6,002.8 MiB** for Qdrant FP32 (**3.1×** RAM, **4.0×** disk), **6,450.6 MiB** / **5,841.7 MiB** for Qdrant SQ8 (**3.1×** RAM, **3.9×** disk), **6,306.9 MiB** / **7,935.1 MiB** for `pgvector` FP32 (**3.0×** RAM, **5.2×** disk), **4,248.8 MiB** / **3,537.4 MiB** for `pgvector halfvec` (**2.0×** RAM, **2.3×** disk), and **6,998.1 MiB** `VmHWM` for FAISS IVF-Flat (**3.4×** RAM).
+- **Throughput & recall at 1M × 768d:** OspreyDB hits `0.9620` test recall at `4.378 ms` P50 (`671.1 QPS`), outperforming Qdrant FP32 (`545.7 / 457.4 QPS`), Qdrant SQ8 (`417.0 / 406.4 QPS`), and FAISS IVF-Flat (`289.7 / 147.7 QPS`) in concurrent QPS while building **3.1×–9.0× faster** (`184.3 s` vs `580–1,656 s`) than all containerized baselines. With `oversampling` unlocked to `20.0–30.0` on origin-centered 768d vectors, Qdrant BQ reaches `4,870 / 4,212 QPS` (`0.805 / 0.849 ms`, `0.9658 / 0.9762` recall) at `4,851.4 MiB` peak RAM (**2.3×** OspreyDB's cgroup peak). Note that calibration splits differed from the 550-query test split by ~1%: at `0.97` calibration, OspreyDB (`0.9720 -> 0.9620`), Qdrant FP32/SQ8, and `pgvector` slightly under-shot `0.97` on test, leaving Qdrant BQ and FAISS IVF as the two configurations hitting `>= 0.97` on test.
 
 ## Reproduction
 
 ```bash
-make bench-compare-controlled OSPREY_SRC=../ospreydb
+make bench-compare-controlled-vldb OSPREY_SRC=../ospreydb
 ```
