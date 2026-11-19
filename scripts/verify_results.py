@@ -7,20 +7,24 @@ and generated SVG figures.
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import re
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
 RESULTS_DIR = ROOT / "results"
 CONTROLLED_CSV = RESULTS_DIR / "compare_engines_controlled.csv"
 CONTROLLED_JSON = RESULTS_DIR / "compare_engines_controlled.json"
 CONTROLLED_MD = RESULTS_DIR / "compare_engines_controlled.md"
+LUTRANK_CSV = RESULTS_DIR / "lutrank_vs_colbert.csv"
 SUMMARY_JSON = RESULTS_DIR / "summary.json"
 PARETO_CSV = RESULTS_DIR / "pareto_s3.csv"
+PARETO_ADAPTIVE_CSV = RESULTS_DIR / "pareto_s3_adaptive.csv"
+PERF_DIR = RESULTS_DIR / "perf"
 README_MD = ROOT / "README.md"
 FIG_DIR = RESULTS_DIR / "figures"
 
@@ -29,7 +33,7 @@ EXPECTED_FIGURES = [
     "fig2_recall_latency_controlled.svg",
     "fig3_build_time_controlled.svg",
     "fig4_validation_test_recall_controlled.svg",
-    "fig5_coalesced_s3_requests_16x.svg",
+    ("fig5_coalesced_s3_requests.svg", "fig5_coalesced_s3_requests_16x.svg"),
     "fig6_lutrank_cpu_vs_gpu.svg",
     "fig7_pareto_recall_latency_s3.svg",
 ]
@@ -52,6 +56,33 @@ def canonical_engine(name: str) -> str:
     if "pgvector" in low:
         return "pgvector FP32"
     return name.strip()
+
+
+def canonical_lutrank_dataset(name: str) -> str:
+    low = name.lower().strip("* ")
+    if "ms marco" in low or low == "msmarco":
+        return "msmarco"
+    if "scifact" in low:
+        return "scifact"
+    if "fiqa" in low:
+        return "fiqa"
+    return low
+
+
+def canonical_lutrank_engine(engine: str, device: str) -> str:
+    eng_low = engine.lower().strip("* ")
+    dev_low = device.lower().strip("* ")
+    if "ospreydb" in eng_low or "lut-rank" in eng_low:
+        return "OspreyDB LUT-Rank (CPU)"
+    if "exact" in eng_low or "numpy" in eng_low or "blas" in dev_low:
+        return "ColBERTv2 Exact FP32 (NumPy/BLAS CPU)"
+    if "onnx" in eng_low or "onnx" in dev_low:
+        return "ColBERTv2 (ONNX Runtime CPU)"
+    if "cuda" in dev_low or "gpu" in dev_low:
+        return "ColBERTv2 (PyTorch CUDA GPU)"
+    if "pytorch" in eng_low:
+        return "ColBERTv2 (PyTorch CPU)"
+    return f"{engine.strip()} [{device.strip()}]"
 
 
 def clean_cell_number(cell: str) -> float:
@@ -92,7 +123,7 @@ def parse_markdown_tables(text: str, section_headers: Dict[str, str]) -> Dict[st
     return tables_by_ds
 
 
-def verify_controlled_csv_and_docs(errors: List[str]) -> None:
+def verify_controlled_csv_and_docs(errors: List[str], warnings: List[str]) -> None:
     if not CONTROLLED_CSV.exists():
         errors.append(f"Missing {CONTROLLED_CSV}")
         return
@@ -106,12 +137,44 @@ def verify_controlled_csv_and_docs(errors: List[str]) -> None:
     # Index CSV rows by (dataset, canonical_engine, recall_target)
     csv_by_key: Dict[Tuple[str, str, str], Dict[str, str]] = {}
     csv_mem_by_ds_eng: Dict[Tuple[str, str], float] = {}
+    build_rss_by_eng: Dict[str, Dict[str, float]] = {}
+
     for row in csv_rows:
         ds = row["dataset"]
         eng = canonical_engine(row["engine"])
         tgt = f"{float(row['recall_target']):.2f}"
         csv_by_key[(ds, eng, tgt)] = row
         csv_mem_by_ds_eng[(ds, eng)] = float(row["query_peak_rss_mb"])
+
+        # Sanity checks (warnings unless --strict)
+        vmhwm = float(row.get("process_vmhwm_mb") or 0.0)
+        q_rss = float(row.get("query_peak_rss_mb") or 0.0)
+        if vmhwm > 0.0 and q_rss > 0.0 and vmhwm > q_rss * 1.05:
+            warnings.append(
+                f"{CONTROLLED_CSV.name} {ds}/{row['variant']} target={tgt}: "
+                f"process_vmhwm_mb ({vmhwm:.1f}) > query_peak_rss_mb * 1.05 ({q_rss * 1.05:.1f}) "
+                f"[possible cross-cgroup page cache leakage]"
+            )
+
+        srv_p50 = float(row.get("server_p50_ms_median") or 0.0)
+        cli_p50 = float(row.get("p50_ms_median") or 0.0)
+        if srv_p50 > 0.0 and srv_p50 > cli_p50:
+            warnings.append(
+                f"{CONTROLLED_CSV.name} {ds}/{row['variant']} target={tgt}: "
+                f"server_p50_ms_median ({srv_p50:.3f}) > p50_ms_median ({cli_p50:.3f})"
+            )
+
+        b_rss = float(row.get("build_peak_rss_mb") or 0.0)
+        if b_rss > 0.0:
+            build_rss_by_eng.setdefault(row["variant"], {})[ds] = b_rss
+
+    for variant, ds_map in sorted(build_rss_by_eng.items()):
+        if len(ds_map) > 1 and len(set(ds_map.values())) < len(ds_map):
+            details = ", ".join(f"{ds}={val:.1f}" for ds, val in sorted(ds_map.items()))
+            warnings.append(
+                f"{CONTROLLED_CSV.name} {variant}: identical build_peak_rss_mb across datasets "
+                f"({details}) [possible cgroup race]"
+            )
 
     # 1. Check JSON files if present
     if CONTROLLED_JSON.exists():
@@ -245,17 +308,153 @@ def verify_controlled_csv_and_docs(errors: List[str]) -> None:
             errors.append(f"{CONTROLLED_MD.name} missing footprint rows for {ds}: {sorted(missing_mem)}")
 
 
-def verify_pareto_s3(errors: List[str]) -> None:
-    if not PARETO_CSV.exists():
-        errors.append(f"Missing {PARETO_CSV}")
+def verify_lutrank_csv_and_readme(errors: List[str]) -> None:
+    if not LUTRANK_CSV.exists():
+        errors.append(f"Missing {LUTRANK_CSV}")
         return
 
-    with open(PARETO_CSV, "r", encoding="utf-8") as fh:
+    with open(LUTRANK_CSV, "r", encoding="utf-8") as fh:
+        csv_rows = list(csv.DictReader(fh))
+    if not csv_rows:
+        errors.append(f"{LUTRANK_CSV} is empty")
+        return
+
+    csv_by_key: Dict[Tuple[str, str], Dict[str, str]] = {}
+    for row in csv_rows:
+        ds = canonical_lutrank_dataset(row["dataset"])
+        eng = canonical_lutrank_engine(row["engine"], row["device"])
+        key = (ds, eng)
+        if key in csv_by_key:
+            errors.append(f"{LUTRANK_CSV.name} duplicate row for {key}")
+        csv_by_key[key] = row
+
+    readme_text = README_MD.read_text(encoding="utf-8")
+    tables = parse_markdown_tables(readme_text, {"### Late-Interaction": "lutrank"})
+    lut_tables = tables.get("lutrank", [])
+    if not lut_tables:
+        errors.append("README.md missing Late-Interaction Reranking table")
+        return
+
+    seen_keys = set()
+    for trow in lut_tables[0]:
+        ds = canonical_lutrank_dataset(trow["Dataset"])
+        eng = canonical_lutrank_engine(trow["Engine"], trow["Device"])
+        key = (ds, eng)
+        seen_keys.add(key)
+        if key not in csv_by_key:
+            errors.append(f"README.md LUT-Rank row {key} not found in {LUTRANK_CSV.name}")
+            continue
+        crow = csv_by_key[key]
+
+        for md_col, csv_col, fmt in (
+            ("P50 (ms)", "p50_ms", ".3f"),
+            ("P99 (ms)", "p99_ms", ".3f"),
+            ("NDCG@10", "ndcg_at_10", ".4f"),
+            ("MRR@10", "mrr_at_10", ".4f"),
+            ("Index (MiB)", "index_mb", ".1f"),
+        ):
+            md_val = clean_cell_number(trow[md_col])
+            csv_val = float(crow[csv_col])
+            if f"{md_val:{fmt}}" != f"{csv_val:{fmt}}":
+                errors.append(
+                    f"README.md LUT-Rank {key} {md_col}={md_val:{fmt}} != CSV {csv_val:{fmt}}"
+                )
+
+        md_qps = clean_cell_number(trow["QPS"])
+        csv_qps = float(crow["qps"])
+        if round(md_qps) != round(csv_qps):
+            errors.append(
+                f"README.md LUT-Rank {key} QPS={md_qps:.0f} != CSV {csv_qps:.1f} (round {round(csv_qps)})"
+            )
+
+    missing = set(csv_by_key.keys()) - seen_keys
+    if missing:
+        errors.append(f"README.md LUT-Rank table missing rows from CSV: {sorted(missing)}")
+
+
+def _verify_pareto_rows(
+    csv_path: Path,
+    required_cols: set[str],
+    group_by_policy: bool,
+    min_on_recall: Optional[float],
+    errors: List[str],
+) -> Optional[List[Dict[str, str]]]:
+    if not csv_path.exists():
+        errors.append(f"Missing {csv_path}")
+        return None
+
+    with open(csv_path, "r", encoding="utf-8") as fh:
         rows = list(csv.DictReader(fh))
     if not rows:
-        errors.append(f"{PARETO_CSV} is empty")
-        return
+        errors.append(f"{csv_path} is empty")
+        return None
 
+    missing_cols = required_cols - set(rows[0].keys())
+    if missing_cols:
+        errors.append(f"{csv_path.name} missing required columns: {sorted(missing_cols)}")
+        return None
+
+    coalesce_on = [r for r in rows if r["coalesce_enabled"].lower() == "true"]
+    coalesce_off = [r for r in rows if r["coalesce_enabled"].lower() == "false"]
+    if not coalesce_on:
+        errors.append(f"{csv_path.name} has no coalesce_enabled=True rows")
+        return None
+    if not coalesce_off:
+        errors.append(f"{csv_path.name} has no coalesce_enabled=False rows")
+        return None
+
+    if min_on_recall is not None:
+        max_recall = max(float(r["recall_at_10"]) for r in coalesce_on)
+        if max_recall < min_on_recall:
+            errors.append(
+                f"{csv_path.name} max recall_at_10 for coalesce_enabled=True is {max_recall:.4f} (< {min_on_recall:.2f})"
+            )
+
+    for idx, r in enumerate(rows, start=2):
+        raw_p = float(r["avg_raw_pages"])
+        gets = float(r["avg_s3_gets"])
+        factor = float(r["coalesce_factor"])
+        expected = raw_p / max(gets, 1e-9)
+        if abs(factor - expected) / max(expected, 1.0) > 0.02:
+            errors.append(
+                f"{csv_path.name} line {idx}: coalesce_factor={factor:.3f} != avg_raw_pages/avg_s3_gets={expected:.3f}"
+            )
+        if r["coalesce_enabled"].lower() == "true":
+            if factor < 1.0 or gets > raw_p + 1e-6:
+                errors.append(
+                    f"{csv_path.name} line {idx}: coalesce_enabled=True has factor={factor:.3f} (< 1.0)"
+                )
+        else:
+            if abs(factor - 1.0) > 0.02:
+                errors.append(
+                    f"{csv_path.name} line {idx}: coalesce_enabled=False has factor={factor:.3f} (!= 1.0)"
+                )
+
+    def pair_key(r: Dict[str, str]) -> Tuple[object, ...]:
+        base: List[object] = [r.get("workers", "1"), int(r["nprobe"]), int(r["refine_m"])]
+        if group_by_policy:
+            base.insert(0, r["refine_policy"])
+        return tuple(base)
+
+    off_map = {pair_key(r): r for r in coalesce_off}
+    paired_checked = 0
+    for r in coalesce_on:
+        key = pair_key(r)
+        if key in off_map:
+            paired_checked += 1
+            on_gets = float(r["avg_s3_gets"])
+            off_gets = float(off_map[key]["avg_s3_gets"])
+            if on_gets >= off_gets:
+                errors.append(
+                    f"{csv_path.name} {key}: coalesce ON avg_s3_gets ({on_gets:.2f}) >= OFF ({off_gets:.2f})"
+                )
+    if paired_checked == 0:
+        errors.append(f"{csv_path.name}: no matching pairs between coalesce ON and OFF")
+
+    return rows
+
+
+def verify_pareto_s3(errors: List[str]) -> None:
     required_cols = {
         "nprobe",
         "refine_m",
@@ -267,60 +466,15 @@ def verify_pareto_s3(errors: List[str]) -> None:
         "coalesce_factor",
         "dataset",
     }
-    missing_cols = required_cols - set(rows[0].keys())
-    if missing_cols:
-        errors.append(f"{PARETO_CSV.name} missing required columns: {sorted(missing_cols)}")
+    rows = _verify_pareto_rows(
+        PARETO_CSV,
+        required_cols,
+        group_by_policy=False,
+        min_on_recall=0.90,
+        errors=errors,
+    )
+    if not rows:
         return
-
-    coalesce_on = [r for r in rows if r["coalesce_enabled"].lower() == "true"]
-    coalesce_off = [r for r in rows if r["coalesce_enabled"].lower() == "false"]
-    if not coalesce_on:
-        errors.append(f"{PARETO_CSV.name} has no coalesce_enabled=True rows")
-        return
-    if not coalesce_off:
-        errors.append(f"{PARETO_CSV.name} has no coalesce_enabled=False rows")
-        return
-
-    max_recall = max(float(r["recall_at_10"]) for r in coalesce_on)
-    if max_recall < 0.90:
-        errors.append(
-            f"{PARETO_CSV.name} max recall_at_10 for coalesce_enabled=True is {max_recall:.4f} (< 0.90)"
-        )
-
-    for idx, r in enumerate(rows, start=2):
-        raw_p = float(r["avg_raw_pages"])
-        gets = float(r["avg_s3_gets"])
-        factor = float(r["coalesce_factor"])
-        expected = raw_p / max(gets, 1e-9)
-        if abs(factor - expected) / max(expected, 1.0) > 0.02:
-            errors.append(
-                f"{PARETO_CSV.name} line {idx}: coalesce_factor={factor:.3f} != avg_raw_pages/avg_s3_gets={expected:.3f}"
-            )
-        if r["coalesce_enabled"].lower() == "true":
-            if factor < 1.0 or gets > raw_p + 1e-6:
-                errors.append(
-                    f"{PARETO_CSV.name} line {idx}: coalesce_enabled=True has factor={factor:.3f} (< 1.0)"
-                )
-        else:
-            if abs(factor - 1.0) > 0.02:
-                errors.append(
-                    f"{PARETO_CSV.name} line {idx}: coalesce_enabled=False has factor={factor:.3f} (!= 1.0)"
-                )
-
-    off_map = {(int(r["nprobe"]), int(r["refine_m"])): r for r in coalesce_off}
-    paired_checked = 0
-    for r in coalesce_on:
-        key = (int(r["nprobe"]), int(r["refine_m"]))
-        if key in off_map:
-            paired_checked += 1
-            on_gets = float(r["avg_s3_gets"])
-            off_gets = float(off_map[key]["avg_s3_gets"])
-            if on_gets >= off_gets:
-                errors.append(
-                    f"{PARETO_CSV.name} {key}: coalesce ON avg_s3_gets ({on_gets:.2f}) >= OFF ({off_gets:.2f})"
-                )
-    if paired_checked == 0:
-        errors.append(f"{PARETO_CSV.name}: no matching (nprobe, refine_m) pairs between coalesce ON and OFF")
 
     # Verify README.md S3 section reflects pareto_s3.csv
     readme_text = README_MD.read_text(encoding="utf-8")
@@ -331,18 +485,85 @@ def verify_pareto_s3(errors: List[str]) -> None:
         errors.append(f"README.md S3 section does not mention {len(rows)}-point sweep")
 
 
+def verify_pareto_adaptive(errors: List[str]) -> None:
+    required_cols = {
+        "nprobe",
+        "refine_m",
+        "coalesce_enabled",
+        "queries_evaluated",
+        "recall_at_10",
+        "p50_ms",
+        "avg_raw_pages",
+        "avg_s3_gets",
+        "coalesce_factor",
+        "dataset",
+        "refine_policy",
+        "requested_refine_multiplier",
+    }
+    rows = _verify_pareto_rows(
+        PARETO_ADAPTIVE_CSV,
+        required_cols,
+        group_by_policy=True,
+        min_on_recall=None,
+        errors=errors,
+    )
+    if not rows:
+        return
+
+    policies = {r["refine_policy"] for r in rows}
+    if not {"baseline", "adaptive"}.issubset(policies):
+        errors.append(
+            f"{PARETO_ADAPTIVE_CSV.name} missing expected policies (got {sorted(policies)})"
+        )
+
+
+def verify_perf_logs(warnings: List[str]) -> None:
+    if not PERF_DIR.exists():
+        return
+    for path in sorted(PERF_DIR.iterdir()):
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if "/home/" in line:
+                warnings.append(
+                    f"{path.relative_to(ROOT)}:{lineno}: absolute /home/ path leaked in perf log"
+                )
+
+
 def verify_figures(errors: List[str]) -> None:
-    for name in EXPECTED_FIGURES:
-        path = FIG_DIR / name
-        if not path.exists() or path.stat().st_size == 0:
-            errors.append(f"Missing or empty figure: {path}")
+    for entry in EXPECTED_FIGURES:
+        candidates: Sequence[str] = (entry,) if isinstance(entry, str) else entry
+        if not any((FIG_DIR / name).exists() and (FIG_DIR / name).stat().st_size > 0 for name in candidates):
+            joined = " or ".join(str(FIG_DIR / name) for name in candidates)
+            errors.append(f"Missing or empty figure: {joined}")
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Verify OspreyDB benchmark artifacts.")
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Promote sanity warnings (e.g. cgroup/latency/path-leak checks) to fatal errors.",
+    )
+    args = parser.parse_args()
+
     errors: List[str] = []
-    verify_controlled_csv_and_docs(errors)
+    warnings: List[str] = []
+
+    verify_controlled_csv_and_docs(errors, warnings)
+    verify_lutrank_csv_and_readme(errors)
     verify_pareto_s3(errors)
+    verify_pareto_adaptive(errors)
+    verify_perf_logs(warnings)
     verify_figures(errors)
+
+    if args.strict and warnings:
+        errors.extend(warnings)
+        warnings = []
+
+    for warn in warnings:
+        print(f"[verify_results] WARN: {warn}")
 
     if errors:
         print("[verify_results] FAILED:")
@@ -350,7 +571,10 @@ def main() -> int:
             print(f"  - {err}")
         return 1
 
-    print("[verify_results] OK: CSVs, JSONs, Markdown tables, pareto_s3.csv, and 7 SVGs are consistent.")
+    print(
+        "[verify_results] OK: CSVs, JSONs, Markdown tables, pareto_s3.csv, "
+        "pareto_s3_adaptive.csv, lutrank_vs_colbert.csv, and 7 SVGs are consistent."
+    )
     return 0
 
 

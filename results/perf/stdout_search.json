@@ -1,6 +1,6 @@
 {
-  "index_path": "/home/ramos/orca/workspaces/osprey-benchmarks/artifacts/perf_profile/segment.osi",
-  "slabs_uri": "/home/ramos/orca/workspaces/osprey-benchmarks/artifacts/perf_profile/segment.osv",
+  "index_path": "artifacts/perf_profile/segment.osi",
+  "slabs_uri": "artifacts/perf_profile/segment.osv",
   "rerank_store": null,
   "top_k": 10,
   "nprobe": 16,
