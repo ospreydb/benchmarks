@@ -2743,7 +2743,11 @@ def run_controlled(args: Any) -> int:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     ensure_compose_services()
 
-    nprobe_grid = [8, 16, 32, 64] if not args.quick else [16, 32]
+    nprobe_grid = (
+        ([8, 16, 32, 64, 128] if int(args.clusters) >= 1024 else [8, 16, 32, 64])
+        if not args.quick
+        else [16, 32]
+    )
     refine_grid = (
         [300, 500, 800, 1000, 1200, 1500, 2000, 2500, 3000, 4000]
         if not args.quick
